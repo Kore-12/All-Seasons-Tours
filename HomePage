@@ -1,0 +1,819 @@
+import wixData from 'wix-data';
+import wixLocation from 'wix-location';
+import { local, session, memory } from 'wix-storage-frontend';
+
+// Enhanced cache configuration with SWR patterns
+const CACHE_CONFIG = {
+  BEST_SELLERS_KEY: 'bs_cache_v4',
+  HOMEPAGE_PRODUCTS_KEY: 'hp_cache_v4',
+  CATEGORY_IDS_KEY: 'cat_ids_cache_v4',
+  PAGE_STATE_KEY: 'page_state_cache',
+  TTL: 5 * 60 * 1000, // 5 minutes
+  STALE_TTL: 10 * 60 * 1000, // 10 minutes - serve stale data beyond this
+  CATEGORY_TTL: 30 * 60 * 1000,
+  ERROR_CACHE_TTL: 30 * 1000,
+  VERSION: '4.0',
+  MAX_ITEMS: 12,
+  PRELOAD_KEY: 'preload_data_v4',
+  FALLBACK_KEY: 'fallback_data_v4',
+  STORAGE_QUOTA_KEY: 'storage_quota_check',
+  BACKGROUND_REFRESH_KEY: 'bg_refresh_state'
+};
+
+// Loading states manager
+const LoadingManager = {
+  states: new Map(),
+  
+  setLoading(elementId, isLoading = true) {
+    try {
+      const element = $w(`#${elementId}`);
+      if (!element) return;
+      
+      if (isLoading) {
+        const originalText = element.text;
+        this.states.set(elementId, originalText);
+        element.text = `${originalText} ⏳`;
+      } else {
+        const originalText = this.states.get(elementId);
+        if (originalText) {
+          element.text = originalText;
+          this.states.delete(elementId);
+        }
+      }
+    } catch (e) {
+      console.warn(`Loading state update failed for ${elementId}:`, e.message);
+    }
+  },
+
+  setLoadingWithDots(elementId, baseText = 'Loading') {
+    try {
+      const element = $w(`#${elementId}`);
+      if (!element) return;
+      
+      let dots = '';
+      const interval = setInterval(() => {
+        dots = dots.length >= 3 ? '' : dots + '.';
+        element.text = `${baseText}${dots}`;
+      }, 500);
+      
+      this.states.set(elementId, { interval, originalText: element.text });
+    } catch (e) {
+      console.warn(`Animated loading failed for ${elementId}:`, e.message);
+    }
+  },
+
+  clearLoading(elementId, finalText = null) {
+    try {
+      const element = $w(`#${elementId}`);
+      if (!element) return;
+      
+      const state = this.states.get(elementId);
+      if (state && state.interval) {
+        clearInterval(state.interval);
+      }
+      
+      if (finalText) {
+        element.text = finalText;
+      } else if (state && state.originalText) {
+        element.text = state.originalText;
+      }
+      
+      this.states.delete(elementId);
+    } catch (e) {
+      console.warn(`Clear loading failed for ${elementId}:`, e.message);
+    }
+  }
+};
+
+// Enhanced cache manager with wix-storage-frontend
+const AdvancedCacheManager = {
+  // Storage quota monitoring using memory for temporary data
+  async checkStorageQuota() {
+    try {
+      if ('storage' in navigator && 'estimate' in navigator.storage) {
+        const estimate = await navigator.storage.estimate();
+        const usedPercent = (estimate.usage / estimate.quota) * 100;
+        
+        if (usedPercent > 80) {
+          console.warn(`Storage usage at ${usedPercent.toFixed(1)}%, triggering cleanup`);
+          this.intelligentCleanup();
+        }
+        
+        // Cache quota check using session storage
+        await session.setItem(CACHE_CONFIG.STORAGE_QUOTA_KEY, JSON.stringify({
+          timestamp: Date.now(),
+          usedPercent: usedPercent
+        }));
+        
+        return usedPercent;
+      }
+    } catch (e) {
+      console.warn('Storage quota check failed:', e.message);
+    }
+    return null;
+  },
+
+  // SWR-style cache retrieval with new storage API
+  async getWithSWR(key) {
+    try {
+      let cached = await session.getItem(key + '_session');
+      if (!cached) {
+        cached = await local.getItem(key);
+      }
+      
+      if (!cached) return { data: null, isStale: false, shouldRevalidate: true };
+
+      const entry = JSON.parse(cached);
+      const now = Date.now();
+      const age = now - entry.timestamp;
+      const customTTL = entry.ttl || CACHE_CONFIG.TTL;
+      
+      const isExpired = age > customTTL;
+      const isStale = age > CACHE_CONFIG.STALE_TTL;
+      const isVersionMismatch = entry.version !== CACHE_CONFIG.VERSION;
+
+      if (isVersionMismatch) {
+        await this.remove(key);
+        return { data: null, isStale: false, shouldRevalidate: true };
+      }
+
+      if (isExpired) {
+        if (isStale) {
+          await this.remove(key);
+          return { data: null, isStale: true, shouldRevalidate: true };
+        }
+        return { data: entry.data, isStale: true, shouldRevalidate: true };
+      }
+
+      return { data: entry.data, isStale: false, shouldRevalidate: false };
+    } catch (e) {
+      console.warn('SWR cache read failed:', e.message);
+      return { data: null, isStale: false, shouldRevalidate: true };
+    }
+  },
+
+  // Enhanced set with proactive quota checking
+  async set(key, data, customTTL = null) {
+    try {
+      const quotaData = await session.getItem(CACHE_CONFIG.STORAGE_QUOTA_KEY);
+      if (!quotaData || (Date.now() - JSON.parse(quotaData).timestamp) > 300000) {
+        await this.checkStorageQuota();
+      }
+
+      const limitedData = this.optimizeDataForCache(data);
+      const cacheEntry = {
+        data: limitedData,
+        timestamp: Date.now(),
+        version: CACHE_CONFIG.VERSION,
+        ttl: customTTL || CACHE_CONFIG.TTL,
+        isError: false
+      };
+      
+      const serialized = JSON.stringify(cacheEntry);
+      
+      if (serialized.length > 24000) {
+        console.warn(`Cache ${key} too large, compressing...`);
+        const compressedData = this.compressData(limitedData);
+        cacheEntry.data = compressedData;
+      }
+      
+      await local.setItem(key, JSON.stringify(cacheEntry));
+      
+      try {
+        await session.setItem(key + '_session', JSON.stringify(cacheEntry));
+      } catch (e) {
+        // Session storage full, continue
+      }
+      
+    } catch (e) {
+      if (e.name === 'QuotaExceededError') {
+        await this.checkStorageQuota();
+        await this.intelligentCleanup();
+        await this.set(key, data, customTTL);
+      } else {
+        console.warn('Cache write failed:', e.message);
+      }
+    }
+  },
+
+  // Background refresh state management
+  async getBackgroundRefreshState(key) {
+    try {
+      const state = await session.getItem(CACHE_CONFIG.BACKGROUND_REFRESH_KEY + '_' + key);
+      if (!state) return { attempts: 0, lastAttempt: 0, backoffUntil: 0 };
+      
+      return JSON.parse(state);
+    } catch (e) {
+      return { attempts: 0, lastAttempt: 0, backoffUntil: 0 };
+    }
+  },
+
+  async setBackgroundRefreshState(key, state) {
+    try {
+      await session.setItem(
+        CACHE_CONFIG.BACKGROUND_REFRESH_KEY + '_' + key, 
+        JSON.stringify(state)
+      );
+    } catch (e) {
+      console.warn('Failed to set background refresh state:', e.message);
+    }
+  },
+
+  calculateBackoffDelay(attempts) {
+    return Math.min(1000 * Math.pow(2, attempts), 30000);
+  },
+
+  async shouldSkipBackgroundRefresh(key) {
+    const state = await this.getBackgroundRefreshState(key);
+    const now = Date.now();
+    return now < state.backoffUntil;
+  },
+
+  async recordBackgroundRefreshAttempt(key, success) {
+    const state = await this.getBackgroundRefreshState(key);
+    const now = Date.now();
+    
+    if (success) {
+      await this.setBackgroundRefreshState(key, { attempts: 0, lastAttempt: now, backoffUntil: 0 });
+    } else {
+      const newAttempts = state.attempts + 1;
+      const backoffDelay = this.calculateBackoffDelay(newAttempts);
+      
+      await this.setBackgroundRefreshState(key, {
+        attempts: newAttempts,
+        lastAttempt: now,
+        backoffUntil: now + backoffDelay
+      });
+    }
+  },
+
+  async setErrorState(key, error) {
+    try {
+      const errorEntry = {
+        data: null,
+        timestamp: Date.now(),
+        version: CACHE_CONFIG.VERSION,
+        ttl: CACHE_CONFIG.ERROR_CACHE_TTL,
+        isError: true,
+        errorMessage: error.message || 'Unknown error'
+      };
+      
+      await session.setItem(key + '_error', JSON.stringify(errorEntry));
+    } catch (e) {
+      console.warn('Error cache write failed:', e.message);
+    }
+  },
+
+  async hasRecentError(key) {
+    try {
+      const errorCache = await session.getItem(key + '_error');
+      if (!errorCache) return false;
+
+      const entry = JSON.parse(errorCache);
+      const now = Date.now();
+      const isExpired = (now - entry.timestamp) > entry.ttl;
+
+      if (isExpired) {
+        await session.removeItem(key + '_error');
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
+
+  async setFallback(key, data) {
+    try {
+      const fallbackEntry = {
+        data: this.optimizeDataForCache(data),
+        timestamp: Date.now(),
+        version: CACHE_CONFIG.VERSION
+      };
+      
+      await local.setItem(key + '_fallback', JSON.stringify(fallbackEntry));
+    } catch (e) {
+      console.warn('Fallback cache failed:', e.message);
+    }
+  },
+
+  async getFallback(key) {
+    try {
+      const cached = await local.getItem(key + '_fallback');
+      if (!cached) return null;
+
+      const entry = JSON.parse(cached);
+      return entry.data;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  optimizeDataForCache(data) {
+    if (!Array.isArray(data)) return data;
+    
+    return data.slice(0, CACHE_CONFIG.MAX_ITEMS).map(item => ({
+      _id: item._id,
+      name: item.name,
+      slug: item.slug,
+      mainMedia: item.mainMedia,
+      formattedPrice: item.formattedPrice,
+      formattedDiscountedPrice: item.formattedDiscountedPrice,
+      discountedPrice: item.discountedPrice,
+      collections: item.collections
+    }));
+  },
+
+  compressData(data) {
+    if (!Array.isArray(data)) return data;
+    return data.slice(0, Math.floor(CACHE_CONFIG.MAX_ITEMS * 0.7));
+  },
+
+  async remove(key) {
+    try {
+      await local.removeItem(key);
+      await session.removeItem(key + '_session');
+      await session.removeItem(key + '_error');
+      await local.removeItem(key + '_fallback');
+    } catch (e) {
+      console.warn('Cache remove failed:', e.message);
+    }
+  },
+
+  async intelligentCleanup() {
+    try {
+      const keysToClean = [
+        CACHE_CONFIG.BEST_SELLERS_KEY,
+        CACHE_CONFIG.HOMEPAGE_PRODUCTS_KEY,
+        CACHE_CONFIG.PAGE_STATE_KEY,
+        CACHE_CONFIG.PRELOAD_KEY,
+        CACHE_CONFIG.FALLBACK_KEY
+      ];
+      
+      for (const key of keysToClean) {
+        await this.remove(key);
+      }
+      
+      // Clear old versions
+      for (let i = 1; i <= 4; i++) {
+        const oldKeys = ['bs_cache_v', 'hp_cache_v', 'cat_ids_cache_v', 'preload_data_v'];
+        for (const prefix of oldKeys) {
+          try {
+            await local.removeItem(prefix + i);
+            await session.removeItem(prefix + i);
+          } catch (e) {}
+        }
+      }
+      
+    } catch (e) {
+      console.warn('Cache cleanup failed:', e.message);
+    }
+  }
+};
+
+// Enhanced UI helpers with loading indicators
+export const UIHelpers = {
+  setupQuickFilters() {
+    const quickFilters = {
+      catButton: "Boat Trips",
+      nightButt: "Nightlife", 
+      cultButt: "Cultural",
+      advButton: "Adventure",
+      fishbutton: "Fishing Charters",
+      snorkbutton: "Snorkel Experiences"
+    };
+
+    Object.entries(quickFilters).forEach(([btnId, categoryName]) => {
+      try {
+        const button = $w(`#${btnId}`);
+        if (button) {
+          button.onClick(() => {
+            LoadingManager.setLoading(btnId);
+            const url = `/categorypage?category=${encodeURIComponent(categoryName)}`;
+            wixLocation.to(url);
+          });
+        }
+      } catch (e) {
+        console.warn(`Button ${btnId} not found:`, e.message);
+      }
+    });
+  },
+
+  setupCarouselUI(bestSellers) {
+    let currentIndex = 0;
+    let currentSlug = "";
+
+    if (bestSellers.length === 0) {
+      this.setupEmptyCarousel();
+      return;
+    }
+
+    const firstProduct = bestSellers[0];
+    try {
+      const mainImage = $w("#mainImage");
+      const tourTitle = $w("#tourTitle");
+      const backButton = $w("#backButton");
+      const nextButton = $w("#nextButton");
+      
+      LoadingManager.clearLoading('tourTitle', firstProduct.name || 'Tour Available');
+      
+      if (mainImage && firstProduct.mainMedia) {
+        mainImage.src = firstProduct.mainMedia;
+      }
+      if (tourTitle && firstProduct.name) {
+        tourTitle.text = firstProduct.name;
+      }
+      if (firstProduct.slug) {
+        currentSlug = firstProduct.slug;
+      }
+      
+      if (backButton) backButton.disable();
+      if (nextButton) {
+        nextButton[bestSellers.length > 1 ? 'enable' : 'disable']();
+      }
+    } catch (e) {
+      console.warn("Error setting initial product:", e.message);
+    }
+
+    this.attachCarouselEventHandlers(bestSellers, currentIndex, currentSlug);
+  },
+
+  attachCarouselEventHandlers(bestSellers, currentIndex, currentSlug) {
+    try {
+      const backButton = $w("#backButton");
+      const nextButton = $w("#nextButton");
+      const bookButton = $w("#bookNow");
+
+      if (backButton) {
+        backButton.onClick(() => {
+          if (currentIndex > 0) {
+            LoadingManager.setLoading('tourTitle');
+            currentIndex--;
+            currentSlug = this.showProduct(currentIndex, bestSellers, currentSlug);
+          }
+        });
+      }
+
+      if (nextButton) {
+        nextButton.onClick(() => {
+          if (currentIndex < bestSellers.length - 1) {
+            LoadingManager.setLoading('tourTitle');
+            currentIndex++;
+            currentSlug = this.showProduct(currentIndex, bestSellers, currentSlug);
+          }
+        });
+      }
+
+      if (bookButton) {
+        bookButton.enable();
+        bookButton.onClick(() => {
+          LoadingManager.setLoading('bookNow');
+          const targetSlug = currentSlug || bestSellers[currentIndex]?.slug;
+          if (targetSlug) {
+            wixLocation.to(`/products/${targetSlug}`);
+          }
+        });
+      }
+    } catch (e) {
+      console.warn("Error setting up carousel event handlers:", e.message);
+    }
+  },
+
+  showProduct(index, bestSellers, currentSlug) {
+    if (index < 0 || index >= bestSellers.length) return currentSlug;
+    
+    const product = bestSellers[index];
+    try {
+      const mainImage = $w("#mainImage");
+      const tourTitle = $w("#tourTitle");
+      const backButton = $w("#backButton");
+      const nextButton = $w("#nextButton");
+      
+      if (mainImage && product.mainMedia) {
+        mainImage.src = product.mainMedia;
+      }
+      if (tourTitle && product.name) {
+        LoadingManager.clearLoading('tourTitle', product.name);
+      }
+      
+      const newSlug = product.slug || "";
+      
+      if (backButton) {
+        backButton[index > 0 ? 'enable' : 'disable']();
+      }
+      
+      if (nextButton) {
+        nextButton[index < bestSellers.length - 1 ? 'enable' : 'disable']();
+      }
+      
+      return newSlug;
+    } catch (e) {
+      console.warn("Error updating product display:", e.message);
+      return currentSlug;
+    }
+  },
+
+  setupEmptyCarousel() {
+    try {
+      const tourTitle = $w("#tourTitle");
+      const bookButton = $w("#bookNow");
+      const backButton = $w("#backButton");
+      const nextButton = $w("#nextButton");
+      
+      if (tourTitle) LoadingManager.setLoadingWithDots('tourTitle', 'Loading tours');
+      if (bookButton) bookButton.disable();
+      if (backButton) backButton.disable();
+      if (nextButton) nextButton.disable();
+    } catch (e) {
+      console.warn("Error setting up empty carousel:", e.message);
+    }
+  },
+
+  setupRepeaterUI(homepageProducts) {
+    try {
+      const repeater = $w("#topRepeater");
+      if (repeater && homepageProducts.length > 0) {
+        repeater.data = homepageProducts;
+        
+        repeater.onItemReady(($item, itemData) => {
+          try {
+            const imageTour = $item("#imageTour");
+            if (imageTour && itemData.mainMedia) {
+              imageTour.src = itemData.mainMedia;
+            }
+
+            const titleTour = $item("#titleTour");
+            if (titleTour && itemData.name) {
+              titleTour.text = itemData.name;
+            }
+
+            const tourPrice = $item("#tourPrice");
+            if (tourPrice) {
+              const priceText = itemData.discountedPrice
+                ? itemData.formattedDiscountedPrice
+                : itemData.formattedPrice;
+              tourPrice.text = `Starting from\n${priceText || "N/A"}\nPer Passenger`;
+            }
+
+            const bookTour = $item("#bookTour");
+            if (bookTour) {
+              bookTour.onClick(() => {
+                if (itemData.slug) {
+                  // Add loading state to book button
+                  bookTour.label = "Loading...";
+                  wixLocation.to(`/products/${itemData.slug}`);
+                }
+              });
+            }
+          } catch (e) {
+            console.warn("Error setting up repeater item:", e.message);
+          }
+        });
+      } else {
+        console.warn("Top repeater not found or no products available");
+      }
+    } catch (e) {
+      console.warn("Error setting up repeater:", e.message);
+    }
+  }
+};
+
+// Enhanced category ID fetching with async storage
+export async function getCachedCategoryId(categoryName) {
+  const cacheKey = `${CACHE_CONFIG.CATEGORY_IDS_KEY}_${categoryName}`;
+  
+  if (await AdvancedCacheManager.hasRecentError(cacheKey)) {
+    console.warn(`Skipping ${categoryName} due to recent error`);
+    return null;
+  }
+  
+  const cached = await AdvancedCacheManager.getWithSWR(cacheKey);
+  if (cached.data && !cached.shouldRevalidate) {
+    return cached.data;
+  }
+  
+  try {
+    let result = await wixData.query("Stores/Collections")
+      .eq("name", categoryName)
+      .limit(1)
+      .find();
+    
+    if (!result.items || result.items.length === 0) {
+      const allCollections = await wixData.query("Stores/Collections")
+        .limit(50)
+        .find();
+      
+      const matchingCollection = allCollections.items.find(collection => 
+        collection.name && collection.name.toLowerCase() === categoryName.toLowerCase()
+      );
+      
+      const categoryId = matchingCollection ? matchingCollection._id : null;
+      
+      if (categoryId) {
+        await AdvancedCacheManager.set(cacheKey, categoryId, CACHE_CONFIG.CATEGORY_TTL);
+      }
+      
+      return categoryId;
+    } else {
+      const categoryId = result.items[0]._id;
+      await AdvancedCacheManager.set(cacheKey, categoryId, CACHE_CONFIG.CATEGORY_TTL);
+      return categoryId;
+    }
+    
+  } catch (error) {
+    console.error(`Error fetching category ID for ${categoryName}:`, error.message);
+    await AdvancedCacheManager.setErrorState(cacheKey, error);
+    return cached.data || null;
+  }
+}
+
+// Enhanced SWR data fetching
+export async function getBestSellersWithSWR() {
+  const cacheKey = CACHE_CONFIG.BEST_SELLERS_KEY;
+  const cached = await AdvancedCacheManager.getWithSWR(cacheKey);
+  
+  if (cached.data && !cached.shouldRevalidate) {
+    return cached.data;
+  }
+  
+  if (cached.isStale && await AdvancedCacheManager.shouldSkipBackgroundRefresh(cacheKey)) {
+    return cached.data || await AdvancedCacheManager.getFallback(cacheKey) || [];
+  }
+  
+  try {
+    const bestSellersId = await getCachedCategoryId("Best Sellers");
+    let products = [];
+    
+    if (bestSellersId) {
+      try {
+        const result = await wixData.query("Stores/Products")
+          .hasSome("collections", [bestSellersId])
+          .limit(CACHE_CONFIG.MAX_ITEMS)
+          .find();
+        
+        products = result.items || [];
+      } catch (hasomeError) {
+        console.warn("hasSome query failed, trying fallback method:", hasomeError.message);
+        
+        const allProductsResult = await wixData.query("Stores/Products")
+          .limit(50)
+          .find();
+        
+        products = allProductsResult.items?.filter(product => 
+          product.collections && product.collections.includes(bestSellersId)
+        ).slice(0, CACHE_CONFIG.MAX_ITEMS) || [];
+      }
+    }
+    
+    if (products.length === 0) {
+      const generalResult = await wixData.query("Stores/Products")
+        .limit(CACHE_CONFIG.MAX_ITEMS)
+        .find();
+      
+      products = generalResult.items || [];
+    }
+    
+    if (products.length > 0) {
+      await AdvancedCacheManager.set(cacheKey, products);
+      await AdvancedCacheManager.setFallback(cacheKey, products);
+      await AdvancedCacheManager.recordBackgroundRefreshAttempt(cacheKey, true);
+    }
+    
+    return products;
+    
+  } catch (error) {
+    console.error("Best sellers fetch failed:", error.message);
+    await AdvancedCacheManager.setErrorState(cacheKey, error);
+    await AdvancedCacheManager.recordBackgroundRefreshAttempt(cacheKey, false);
+    
+    return cached.data || await AdvancedCacheManager.getFallback(cacheKey) || [];
+  }
+}
+
+export async function getHomepageProductsWithSWR() {
+  const cacheKey = CACHE_CONFIG.HOMEPAGE_PRODUCTS_KEY;
+  const cached = await AdvancedCacheManager.getWithSWR(cacheKey);
+  
+  if (cached.data && !cached.shouldRevalidate) {
+    return cached.data;
+  }
+  
+  if (cached.isStale && await AdvancedCacheManager.shouldSkipBackgroundRefresh(cacheKey)) {
+    return cached.data || await AdvancedCacheManager.getFallback(cacheKey) || [];
+  }
+  
+  try {
+    const homepageId = await getCachedCategoryId("Homepage Product Showcase");
+    let products = [];
+    
+    if (homepageId) {
+      try {
+        const result = await wixData.query("Stores/Products")
+          .hasSome("collections", [homepageId])
+          .limit(CACHE_CONFIG.MAX_ITEMS)
+          .find();
+        
+        products = result.items || [];
+      } catch (hasomeError) {
+        console.warn("hasSome query failed, trying fallback method:", hasomeError.message);
+        
+        const allProductsResult = await wixData.query("Stores/Products")
+          .limit(50)
+          .find();
+        
+        products = allProductsResult.items?.filter(product => 
+          product.collections && product.collections.includes(homepageId)
+        ).slice(0, CACHE_CONFIG.MAX_ITEMS) || [];
+      }
+    }
+    
+    if (products.length === 0) {
+      const generalResult = await wixData.query("Stores/Products")
+        .limit(CACHE_CONFIG.MAX_ITEMS)
+        .find();
+      
+      products = generalResult.items || [];
+    }
+    
+    if (products.length > 0) {
+      await AdvancedCacheManager.set(cacheKey, products);
+      await AdvancedCacheManager.setFallback(cacheKey, products);
+      await AdvancedCacheManager.recordBackgroundRefreshAttempt(cacheKey, true);
+    }
+    
+    return products;
+    
+  } catch (error) {
+    console.error("Homepage products fetch failed:", error.message);
+    await AdvancedCacheManager.setErrorState(cacheKey, error);
+    await AdvancedCacheManager.recordBackgroundRefreshAttempt(cacheKey, false);
+    
+    return cached.data || await AdvancedCacheManager.getFallback(cacheKey) || [];
+  }
+}
+
+// Enhanced initialization with loading states
+$w.onReady(() => {
+  // Show initial loading states
+  LoadingManager.setLoadingWithDots('tourTitle', 'Loading tours');
+  
+  // Immediate UI setup
+  UIHelpers.setupQuickFilters();
+  
+  // SWR-based data loading
+  Promise.resolve().then(async () => {
+    await loadDataWithSWR();
+  });
+});
+
+async function loadDataWithSWR() {
+  try {
+    const [bestSellers, homepageProducts] = await Promise.allSettled([
+      getBestSellersWithSWR(),
+      getHomepageProductsWithSWR()
+    ]);
+    
+    if (bestSellers.status === 'fulfilled' && bestSellers.value) {
+      UIHelpers.setupCarouselUI(bestSellers.value);
+    } else {
+      UIHelpers.setupEmptyCarousel();
+    }
+    
+    if (homepageProducts.status === 'fulfilled' && homepageProducts.value) {
+      UIHelpers.setupRepeaterUI(homepageProducts.value);
+    }
+    
+  } catch (error) {
+    console.error("SWR data loading failed:", error.message);
+    await handleLoadingErrorWithFallbacks();
+  }
+}
+
+async function handleLoadingErrorWithFallbacks() {
+  const fallbackBestSellers = await AdvancedCacheManager.getFallback(CACHE_CONFIG.BEST_SELLERS_KEY);
+  const fallbackHomepageProducts = await AdvancedCacheManager.getFallback(CACHE_CONFIG.HOMEPAGE_PRODUCTS_KEY);
+  
+  if (fallbackBestSellers && fallbackBestSellers.length > 0) {
+    UIHelpers.setupCarouselUI(fallbackBestSellers);
+  } else {
+    UIHelpers.setupEmptyCarousel();
+  }
+  
+  if (fallbackHomepageProducts && fallbackHomepageProducts.length > 0) {
+    UIHelpers.setupRepeaterUI(fallbackHomepageProducts);
+  }
+  
+  if ((!fallbackBestSellers || fallbackBestSellers.length === 0) && 
+      (!fallbackHomepageProducts || fallbackHomepageProducts.length === 0)) {
+    showErrorMessage();
+  }
+}
+
+function showErrorMessage() {
+  try {
+    LoadingManager.clearLoading('tourTitle', 'Unable to load tours - please refresh the page');
+  } catch (e) {
+    console.warn("Could not display error message");
+  }
+}
