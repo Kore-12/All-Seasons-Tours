@@ -1,0 +1,377 @@
+import wixData from 'wix-data';
+import wixLocation from 'wix-location';
+import { local, session } from 'wix-storage';
+
+// Streamlined cache config
+const CACHE = {
+  BEST_SELLERS: 'bs_v5',
+  HOMEPAGE: 'hp_v5',
+  CATEGORIES: 'cat_v5',
+  TTL: 5 * 60 * 1000, // 5 minutes
+  MAX_ITEMS: 8,
+  VERSION: '5.0'
+};
+
+// Intersection Observer for lazy loading
+const LazyLoader = {
+  observers: new Map(),
+  
+  observe(elementId, callback, threshold = 0.1) {
+    try {
+      const element = $w(`#${elementId}`);
+      if (!element) return;
+      
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach(entry => {
+            if (entry.isIntersecting) {
+              callback();
+              observer.disconnect();
+              this.observers.delete(elementId);
+            }
+          });
+        },
+        { threshold }
+      );
+      
+      observer.observe(element);
+      this.observers.set(elementId, observer);
+    } catch (e) {
+      // Fallback: execute immediately if IntersectionObserver fails
+      callback();
+    }
+  },
+  
+  cleanup() {
+    this.observers.forEach(observer => observer.disconnect());
+    this.observers.clear();
+  }
+};
+
+// Simplified cache manager
+const Cache = {
+  async get(key) {
+    try {
+      let data = session.getItem(key) || local.getItem(key);
+      if (!data) return null;
+      
+      const parsed = JSON.parse(data);
+      const isExpired = (Date.now() - parsed.timestamp) > CACHE.TTL;
+      const isOldVersion = parsed.version !== CACHE.VERSION;
+      
+      if (isExpired || isOldVersion) {
+        this.remove(key);
+        return null;
+      }
+      
+      return parsed.data;
+    } catch (e) {
+      return null;
+    }
+  },
+  
+  async set(key, data) {
+    try {
+      const entry = {
+        data: Array.isArray(data) ? data.slice(0, CACHE.MAX_ITEMS) : data,
+        timestamp: Date.now(),
+        version: CACHE.VERSION
+      };
+      
+      const serialized = JSON.stringify(entry);
+      local.setItem(key, serialized);
+      
+      try {
+        session.setItem(key, serialized);
+      } catch (e) {
+        // Session storage full, continue with local only
+      }
+    } catch (e) {
+      console.warn(`Cache set failed for ${key}`);
+    }
+  },
+  
+  remove(key) {
+    try {
+      local.removeItem(key);
+      session.removeItem(key);
+    } catch (e) {}
+  }
+};
+
+// Backend data processing
+const DataProcessor = {
+  optimizeProduct(product) {
+    return {
+      _id: product._id,
+      name: product.name,
+      slug: product.slug,
+      mainMedia: product.mainMedia,
+      formattedPrice: product.formattedPrice,
+      formattedDiscountedPrice: product.formattedDiscountedPrice,
+      discountedPrice: product.discountedPrice,
+      collections: product.collections
+    };
+  },
+  
+  async getCategoryId(categoryName) {
+    const cacheKey = `${CACHE.CATEGORIES}_${categoryName}`;
+    let categoryId = await Cache.get(cacheKey);
+    
+    if (categoryId) return categoryId;
+    
+    try {
+      const result = await wixData.query("Stores/Collections")
+        .eq("name", categoryName)
+        .limit(1)
+        .find();
+      
+      categoryId = result.items?.[0]?._id || null;
+      
+      if (categoryId) {
+        await Cache.set(cacheKey, categoryId);
+      }
+      
+      return categoryId;
+    } catch (e) {
+      console.warn(`Category fetch failed: ${categoryName}`);
+      return null;
+    }
+  },
+  
+  async fetchProducts(collectionName, fallbackToAll = true) {
+    try {
+      const categoryId = await this.getCategoryId(collectionName);
+      let products = [];
+      
+      if (categoryId) {
+        const result = await wixData.query("Stores/Products")
+          .hasSome("collections", [categoryId])
+          .limit(CACHE.MAX_ITEMS)
+          .find();
+        
+        products = result.items || [];
+      }
+      
+      // Fallback to general products if none found
+      if (products.length === 0 && fallbackToAll) {
+        const result = await wixData.query("Stores/Products")
+          .limit(CACHE.MAX_ITEMS)
+          .find();
+        
+        products = result.items || [];
+      }
+      
+      return products.map(this.optimizeProduct);
+    } catch (e) {
+      console.warn(`Product fetch failed: ${collectionName}`);
+      return [];
+    }
+  }
+};
+
+// UI Controllers
+const UI = {
+  loading: new Map(),
+  
+  setLoading(elementId, isLoading = true) {
+    try {
+      const element = $w(`#${elementId}`);
+      if (!element) return;
+      
+      if (isLoading) {
+        if (!this.loading.has(elementId)) {
+          this.loading.set(elementId, element.text);
+        }
+        element.text = `${this.loading.get(elementId)} ⏳`;
+      } else {
+        const original = this.loading.get(elementId);
+        if (original) {
+          element.text = original;
+          this.loading.delete(elementId);
+        }
+      }
+    } catch (e) {}
+  },
+  
+  setupQuickFilters() {
+    const filters = {
+      catButton: "Boat Trips",
+      nightButt: "Nightlife", 
+      cultButt: "Cultural",
+      advButton: "Adventure",
+      fishbutton: "Fishing Charters",
+      snorkbutton: "Snorkel Experiences"
+    };
+
+    Object.entries(filters).forEach(([btnId, category]) => {
+      try {
+        $w(`#${btnId}`).onClick(() => {
+          this.setLoading(btnId);
+          wixLocation.to(`/categorypage?category=${encodeURIComponent(category)}`);
+        });
+      } catch (e) {}
+    });
+  },
+  
+  setupCarousel(products) {
+    if (!products?.length) {
+      this.setupEmptyCarousel();
+      return;
+    }
+    
+    let index = 0;
+    const product = products[0];
+    
+    try {
+      $w("#mainImage").src = product.mainMedia;
+      $w("#tourTitle").text = product.name;
+      $w("#backButton").disable();
+      $w("#nextButton")[products.length > 1 ? 'enable' : 'disable']();
+      $w("#bookNow").enable(); // Enable the book button
+      
+      this.attachCarouselHandlers(products, index);
+    } catch (e) {
+      this.setupEmptyCarousel();
+    }
+  },
+  
+  attachCarouselHandlers(products, currentIndex) {
+    const showProduct = (index) => {
+      if (index < 0 || index >= products.length) return;
+      
+      const product = products[index];
+      try {
+        $w("#mainImage").src = product.mainMedia;
+        $w("#tourTitle").text = product.name;
+        $w("#backButton")[index > 0 ? 'enable' : 'disable']();
+        $w("#nextButton")[index < products.length - 1 ? 'enable' : 'disable']();
+        return product.slug;
+      } catch (e) {}
+    };
+    
+    let currentSlug = products[currentIndex]?.slug;
+    
+    try {
+      $w("#backButton").onClick(() => {
+        if (currentIndex > 0) {
+          currentIndex--;
+          currentSlug = showProduct(currentIndex) || currentSlug;
+        }
+      });
+      
+      $w("#nextButton").onClick(() => {
+        if (currentIndex < products.length - 1) {
+          currentIndex++;
+          currentSlug = showProduct(currentIndex) || currentSlug;
+        }
+      });
+      
+      $w("#bookNow").onClick(() => {
+        if (currentSlug) {
+          wixLocation.to(`/products/${currentSlug}`);
+        }
+      });
+    } catch (e) {}
+  },
+  
+  setupEmptyCarousel() {
+    try {
+      $w("#tourTitle").text = "Loading tours...";
+      $w("#bookNow").disable();
+      $w("#backButton").disable();
+      $w("#nextButton").disable();
+    } catch (e) {}
+  },
+  
+  setupRepeater(products) {
+    try {
+      const repeater = $w("#topRepeater");
+      if (!repeater || !products?.length) return;
+      
+      repeater.data = products;
+      
+      repeater.onItemReady(($item, itemData) => {
+        try {
+          $item("#imageTour").src = itemData.mainMedia;
+          $item("#titleTour").text = itemData.name;
+          
+          const price = itemData.discountedPrice 
+            ? itemData.formattedDiscountedPrice 
+            : itemData.formattedPrice;
+          $item("#tourPrice").text = `Starting from\n${price || "N/A"}\nPer Passenger`;
+          
+          $item("#bookTour").onClick(() => {
+            if (itemData.slug) {
+              wixLocation.to(`/products/${itemData.slug}`);
+            }
+          });
+        } catch (e) {}
+      });
+    } catch (e) {}
+  }
+};
+
+// Data fetchers with caching
+async function getBestSellers() {
+  let products = await Cache.get(CACHE.BEST_SELLERS);
+  
+  if (!products) {
+    products = await DataProcessor.fetchProducts("Best Sellers");
+    if (products.length > 0) {
+      await Cache.set(CACHE.BEST_SELLERS, products);
+    }
+  }
+  
+  return products || [];
+}
+
+async function getHomepageProducts() {
+  let products = await Cache.get(CACHE.HOMEPAGE);
+  
+  if (!products) {
+    products = await DataProcessor.fetchProducts("Homepage Product Showcase");
+    if (products.length > 0) {
+      await Cache.set(CACHE.HOMEPAGE, products);
+    }
+  }
+  
+  return products || [];
+}
+
+// Main initialization with lazy loading
+$w.onReady(() => {
+  // Immediate UI setup
+  UI.setupQuickFilters();
+  UI.setupEmptyCarousel();
+  
+  // Lazy load carousel when visible
+  LazyLoader.observe('mainImage', async () => {
+    try {
+      const bestSellers = await getBestSellers();
+      UI.setupCarousel(bestSellers);
+    } catch (e) {
+      console.warn('Carousel loading failed:', e);
+    }
+  });
+  
+  // Lazy load repeater when visible
+  LazyLoader.observe('topRepeater', async () => {
+    try {
+      const homepageProducts = await getHomepageProducts();
+      UI.setupRepeater(homepageProducts);
+    } catch (e) {
+      console.warn('Repeater loading failed:', e);
+    }
+  }, 0.2);
+});
+
+// Cleanup on page unload
+$w.onReady(() => {
+  // Setup cleanup for when user navigates away
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', () => {
+      LazyLoader.cleanup();
+    });
+  }
+});
