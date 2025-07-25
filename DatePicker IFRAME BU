@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Custom Date Range Picker</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: transparent;
+      overflow: hidden;
+      height: 100%;
+      width: 100%;
+    }
+
+    #dateContainer {
+      position: fixed;
+      top: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 9999;
+      text-align: center;
+    }
+
+    #dateInput {
+      width: 240px;
+      padding: 10px 14px;
+      border: 1px solid #a5d6a7;
+      border-radius: 12px;
+      font-size: 16px;
+      cursor: pointer;
+      outline: none;
+      text-align: center;
+    }
+
+    .calendar {
+      margin-top: 8px;
+      display: none;
+      width: 240px;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 8px 16px rgba(0,0,0,0.15);
+      padding: 8px;
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+    }
+
+    .calendar.active {
+      display: block;
+    }
+
+    .calendar-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: bold;
+      margin-bottom: 5px;
+      font-size: 13px;
+    }
+
+    /* Month text in orange */
+    .calendar-header div {
+      color: orange;
+    }
+
+    .calendar-header button {
+      border: none;
+      background: none;
+      font-size: 14px;
+      cursor: pointer;
+      padding: 2px 5px;
+      color: inherit; /* Default arrow color (black/gray) */
+    }
+
+    .days-header, .days {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      text-align: center;
+    }
+
+    /* Days of the week in orange */
+    .days-header div {
+      font-weight: bold;
+      padding: 2px;
+      font-size: 11px;
+      color: orange;
+    }
+
+    .days div {
+      position: relative;
+      padding: 8px 0;
+      font-size: 11px;
+      cursor: pointer;
+      z-index: 1;
+      transition: background-color 0.3s;
+      border-radius: 0;
+    }
+
+    /* --- Range Highlight --- */
+    .days div.in-range::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(76, 175, 80, 0.2);
+      z-index: -1;
+    }
+
+    /* Start and End Dates */
+    .days div.start,
+    .days div.end {
+      background-color: #4caf50;
+      color: white;
+      border-radius: 50%;
+      z-index: 2;
+    }
+
+    /* Merge start with range */
+    .days div.start.in-range::before {
+      border-top-left-radius: 50%;
+      border-bottom-left-radius: 50%;
+      left: 50%;
+      width: 50%;
+    }
+
+    /* Merge end with range */
+    .days div.end.in-range::before {
+      border-top-right-radius: 50%;
+      border-bottom-right-radius: 50%;
+      width: 50%;
+    }
+
+    .days div:hover {
+      background-color: rgba(76, 175, 80, 0.1);
+    }
+  </style>
+</head>
+<body>
+  <div id="dateContainer">
+    <input type="text" id="dateInput" readonly placeholder="Arrival Date - Departure Date" />
+    <div class="calendar" id="calendar"></div>
+  </div>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const dateInput = document.getElementById('dateInput');
+      const calendarEl = document.getElementById('calendar');
+
+      const today = new Date();
+      let currentMonth = today.getMonth();
+      let currentYear = today.getFullYear();
+      let startDate = null;
+      let endDate = null;
+
+      dateInput.addEventListener('click', (e) => {
+        e.stopPropagation();
+        calendarEl.classList.add('active');
+        currentMonth = startDate ? startDate.getMonth() : today.getMonth();
+        currentYear = startDate ? startDate.getFullYear() : today.getFullYear();
+        renderCalendar(currentMonth, currentYear);
+      });
+
+      window.addEventListener("click", (e) => {
+        if (!calendarEl.contains(e.target) && e.target !== dateInput) {
+          calendarEl.classList.remove('active');
+        }
+      });
+
+      // Auto-close if iframe loses focus (clicking outside of it)
+      window.addEventListener("blur", () => {
+        calendarEl.classList.remove('active');
+      });
+
+      function renderCalendar(month, year) {
+        calendarEl.innerHTML = '';
+
+        const header = document.createElement('div');
+        header.className = 'calendar-header';
+
+        const prevBtn = document.createElement('button');
+        prevBtn.innerHTML = '&#10094;';
+        prevBtn.onclick = (e) => {
+          e.stopPropagation();
+          currentMonth--;
+          if (currentMonth < 0) {
+            currentMonth = 11;
+            currentYear--;
+          }
+          renderCalendar(currentMonth, currentYear);
+        };
+
+        const nextBtn = document.createElement('button');
+        nextBtn.innerHTML = '&#10095;';
+        nextBtn.onclick = (e) => {
+          e.stopPropagation();
+          currentMonth++;
+          if (currentMonth > 11) {
+            currentMonth = 0;
+            currentYear++;
+          }
+          renderCalendar(currentMonth, currentYear);
+        };
+
+        const monthYear = document.createElement('div');
+        monthYear.textContent = `${new Date(year, month).toLocaleString('default', { month: 'long' })} ${year}`;
+        
+        header.appendChild(prevBtn);
+        header.appendChild(monthYear);
+        header.appendChild(nextBtn);
+        calendarEl.appendChild(header);
+
+        const daysHeader = document.createElement('div');
+        daysHeader.className = 'days-header';
+        ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].forEach(d => {
+          const day = document.createElement('div');
+          day.textContent = d;
+          daysHeader.appendChild(day);
+        });
+        calendarEl.appendChild(daysHeader);
+
+        const days = document.createElement('div');
+        days.className = 'days';
+        const firstDay = new Date(year, month, 1).getDay();
+        const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+        for (let i = 0; i < firstDay; i++) {
+          days.appendChild(document.createElement('div'));
+        }
+
+        for (let day = 1; day <= daysInMonth; day++) {
+          const dayEl = document.createElement('div');
+          dayEl.textContent = day;
+          const date = new Date(year, month, day);
+
+          // Add classes
+          if (startDate && isSameDate(date, startDate)) dayEl.classList.add('start');
+          if (endDate && isSameDate(date, endDate)) dayEl.classList.add('end');
+          if (startDate && endDate && date > startDate && date < endDate) {
+            dayEl.classList.add('in-range');
+          }
+          if (startDate && isSameDate(date, startDate) && endDate) {
+            dayEl.classList.add('start', 'in-range');
+          }
+          if (endDate && isSameDate(date, endDate) && startDate) {
+            dayEl.classList.add('end', 'in-range');
+          }
+
+          dayEl.onclick = (e) => {
+            e.stopPropagation();
+            selectDate(date);
+          };
+          days.appendChild(dayEl);
+        }
+        calendarEl.appendChild(days);
+      }
+
+      function selectDate(date) {
+        if (!startDate || (startDate && endDate)) {
+          startDate = date;
+          endDate = null;
+        } else if (date < startDate) {
+          endDate = startDate;
+          startDate = date;
+        } else {
+          endDate = date;
+        }
+
+        if (startDate && endDate) {
+          dateInput.value = `${formatDate(startDate)} - ${formatDate(endDate)}`;
+        } else {
+          dateInput.value = formatDate(startDate);
+        }
+        renderCalendar(currentMonth, currentYear);
+      }
+
+      function isSameDate(d1, d2) {
+        return d1.getDate() === d2.getDate() &&
+               d1.getMonth() === d2.getMonth() &&
+               d1.getFullYear() === d2.getFullYear();
+      }
+
+      function formatDate(date) {
+        return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      }
+    });
+  </script>
+</body>
+</html>
