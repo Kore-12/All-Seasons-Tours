@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: transparent;
+      overflow: hidden; /* ✅ removes scrollbars */
+      height: 100%;
+      width: 100%;
+    }
+
+    #passengerContainer {
+      position: fixed;
+      top: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 9999;
+      margin-top: 0;
+    }
+
+    #passengerInput {
+      width: 240px;
+      padding: 10px 14px;
+      border: 1px solid #a5d6a7;
+      border-radius: 12px;
+      font-size: 16px;
+      cursor: pointer;
+      outline: none;
+    }
+
+    .dropdown {
+      display: none;
+      margin-top: 8px;
+      width: 280px;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 8px 16px rgba(0,0,0,0.15);
+      padding: 10px;
+      z-index: 1000;
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+
+    .dropdown.active {
+      display: block;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin: 10px 0;
+    }
+
+    .labels {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .labels span:first-child {
+      font-weight: bold;
+      color: #cc6600; /* 🔸 Dark light orange */
+    }
+
+    .labels span:last-child {
+      font-size: 14px;
+      color: #aaa;
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+    }
+
+    .controls button {
+      width: 28px;
+      height: 28px;
+      border: 2px solid #4CAF50; /* ✅ Green border */
+      color: #4CAF50;
+      border-radius: 50%;
+      background: none;
+      font-size: 18px;
+      line-height: 20px;
+      cursor: pointer;
+    }
+
+    .controls span {
+      width: 24px;
+      text-align: center;
+      margin: 0 8px;
+      font-weight: bold;
+      color: orange; /* ✅ Orange number text */
+    }
+
+    .controls button:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+  <div id="passengerContainer">
+    <input type="text" id="passengerInput" readonly placeholder="Passenger Count" />
+
+    <div class="dropdown" id="passengerDropdown">
+      <div class="row">
+        <div class="labels">
+          <span>Adult</span>
+          <span>(11+)</span>
+        </div>
+        <div class="controls">
+          <button type="button" onclick="updateCount('adult', -1)">−</button>
+          <span id="adultCount">0</span>
+          <button type="button" onclick="updateCount('adult', 1)">+</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="labels">
+          <span>Child</span>
+          <span>(2–11)</span>
+        </div>
+        <div class="controls">
+          <button type="button" onclick="updateCount('child', -1)">−</button>
+          <span id="childCount">0</span>
+          <button type="button" onclick="updateCount('child', 1)">+</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="labels">
+          <span>Infant</span>
+          <span>(0–2)</span>
+        </div>
+        <div class="controls">
+          <button type="button" onclick="updateCount('infant', -1)">−</button>
+          <span id="infantCount">0</span>
+          <button type="button" onclick="updateCount('infant', 1)">+</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const input = document.getElementById("passengerInput");
+    const dropdown = document.getElementById("passengerDropdown");
+    const container = document.getElementById("passengerContainer");
+
+    const counts = {
+      adult: 0,
+      child: 0,
+      infant: 0
+    };
+
+    input.addEventListener("click", (e) => {
+      dropdown.classList.toggle("active");
+      e.stopPropagation();
+    });
+
+    // Prevent dropdown from closing when clicking inside it
+    dropdown.addEventListener("click", (e) => {
+      e.stopPropagation();
+    });
+
+    document.addEventListener("click", (e) => {
+      dropdown.classList.remove("active");
+    });
+
+    // Optional: Auto-close if iframe loses focus (clicking outside of it)
+    window.addEventListener("blur", () => {
+      dropdown.classList.remove("active");
+    });
+
+    function updateCount(type, delta) {
+      counts[type] = Math.max(0, counts[type] + delta);
+      document.getElementById(`${type}Count`).textContent = counts[type];
+      updateInput();
+    }
+
+    function updateInput() {
+      const total = counts.adult + counts.child + counts.infant;
+      if (total === 0) {
+        input.value = '';
+        input.placeholder = "Passenger Count";
+      } else {
+        let parts = [];
+        if (counts.adult > 0) parts.push(`${counts.adult} Adult${counts.adult > 1 ? 's' : ''}`);
+        if (counts.child > 0) parts.push(`${counts.child} Child${counts.child > 1 ? 'ren' : ''}`);
+        if (counts.infant > 0) parts.push(`${counts.infant} Infant${counts.infant > 1 ? 's' : ''}`);
+        input.value = parts.join(', ');
+      }
+    }
+  </script>
+</body>
+</html>
