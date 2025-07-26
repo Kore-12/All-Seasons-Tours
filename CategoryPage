@@ -1,0 +1,449 @@
+import wixData from 'wix-data';
+import wixLocation from 'wix-location';
+import wixStorage from 'wix-storage';
+import { session } from 'wix-storage';
+
+// --- Cache Configuration ---
+const CACHE_KEYS = {
+  CATEGORIES: 'categories_map'
+};
+const CACHE_DURATION = 3 * 60 * 1000; // 3 minutes
+const MAX_CACHE_SIZE = 40000; // 40KB limit
+
+// --- Global State Variables ---
+let categoriesMap = {};
+let debounceTimer = null;
+let prefetchTimer = null;
+let currentPage = 1;
+const itemsPerPage = 10;
+let currentFilters = {
+  categoryNames: [],
+  searchTerm: ""
+};
+let isLoading = false;
+let totalItemsCache = 0;
+
+// --- In-Memory Cache ---
+const memoryCache = new Map();
+const MAX_MEMORY_ENTRIES = 10;
+
+// --- Memory Cache Functions ---
+function getMemoryCacheKey(filters, page) {
+  return `${JSON.stringify(filters)}_p${page}`;
+}
+
+function setMemoryCache(key, data) {
+  if (memoryCache.size >= MAX_MEMORY_ENTRIES) {
+    const firstKey = memoryCache.keys().next().value;
+    memoryCache.delete(firstKey);
+  }
+  
+  memoryCache.set(key, {
+    data,
+    timestamp: Date.now()
+  });
+}
+
+function getMemoryCache(key) {
+  const cached = memoryCache.get(key);
+  if (!cached) return null;
+  
+  if (Date.now() - cached.timestamp > CACHE_DURATION) {
+    memoryCache.delete(key);
+    return null;
+  }
+  
+  return cached.data;
+}
+
+// --- Session Storage Functions ---
+function setCachedData(key, data) {
+  try {
+    const serialized = JSON.stringify({ data, timestamp: Date.now() });
+    session.setItem(key, serialized);
+  } catch (err) {
+    if (err.name === 'QuotaExceededError') {
+      console.warn('Session storage full, using memory only');
+    }
+  }
+}
+
+function getCachedData(key) {
+  try {
+    const cached = session.getItem(key);
+    if (!cached) return null;
+    
+    const parsed = JSON.parse(cached);
+    if (Date.now() - parsed.timestamp > CACHE_DURATION) {
+      session.removeItem(key);
+      return null;
+    }
+    
+    return parsed.data;
+  } catch (err) {
+    return null;
+  }
+}
+
+// --- Data Loading Functions ---
+async function preloadCriticalData() {
+  // Check if already loaded
+  if (Object.keys(categoriesMap).length > 0) {
+    return;
+  }
+  
+  // Check session storage
+  const cachedCategories = getCachedData(CACHE_KEYS.CATEGORIES);
+  if (cachedCategories) {
+    categoriesMap = cachedCategories;
+    return;
+  }
+
+  // Load fresh categories
+  try {
+    const colRes = await wixData.query("Stores/Collections")
+      .limit(100)
+      .find();
+    
+    colRes.items.forEach(col => {
+      categoriesMap[col.name] = col._id;
+    });
+    
+    setCachedData(CACHE_KEYS.CATEGORIES, categoriesMap);
+  } catch (err) {
+    console.error("Error loading collections:", err);
+  }
+}
+
+// --- Smart Prefetching ---
+function prefetchNextPage() {
+  if (prefetchTimer) clearTimeout(prefetchTimer);
+  
+  prefetchTimer = setTimeout(async () => {
+    const nextPage = currentPage + 1;
+    const cacheKey = getMemoryCacheKey(currentFilters, nextPage);
+    
+    if (!getMemoryCache(cacheKey)) {
+      try {
+        await loadProductsFromAPI(nextPage, true);
+      } catch (err) {
+        // Silent fail
+      }
+    }
+  }, 1500);
+}
+
+// --- API Loading ---
+async function loadProductsFromAPI(page = currentPage, silent = false) {
+  try {
+    let query = wixData.query("Stores/Products")
+                      .include("collections")
+                      .limit(itemsPerPage)
+                      .skip((page - 1) * itemsPerPage);
+    
+    if (currentFilters.searchTerm) {
+      query = query.contains("name", currentFilters.searchTerm);
+    }
+    
+    if (currentFilters.categoryNames.length > 0) {
+      const ids = currentFilters.categoryNames
+        .map(n => categoriesMap[n])
+        .filter(Boolean);
+      
+      if (ids.length > 0) {
+        query = query.hasSome("collections", ids);
+      }
+    }
+    
+    const results = await query.find({ withCount: true });
+    
+    // Cache in memory
+    const cacheKey = getMemoryCacheKey(currentFilters, page);
+    setMemoryCache(cacheKey, {
+      items: results.items,
+      totalCount: results.totalCount
+    });
+    
+    return results;
+  } catch (err) {
+    if (!silent) {
+      console.error("Error loading products:", err);
+    }
+    throw err;
+  }
+}
+
+// --- Main App Initialization ---
+$w.onReady(async () => {
+  // Parse initial URL parameters
+  const { category } = wixLocation.query;
+  const initialCategory = category ? decodeURIComponent(category) : null;
+  
+  $w("#productRepeater").collapse();
+  
+  // Load categories first
+  await preloadCriticalData();
+  
+  // --- Wire up pagination ---
+  $w("#pagination1").onChange(event => {
+    currentPage = event.target.currentPage;
+    loadProducts();
+  });
+
+  // --- Wire up search ---
+  $w("#tourSearch").onInput(() => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const term = $w("#tourSearch").value.trim().toLowerCase();
+      
+      // Clear category filters when searching
+      currentFilters.categoryNames = [];
+      currentFilters.searchTerm = term;
+      
+      // Update checkbox UI to reflect cleared filters
+      updateCheckboxes();
+      
+      // Reset to page 1 and load
+      currentPage = 1;
+      loadProducts();
+    }, 400);
+  });
+
+  // --- Quick filter buttons ---
+  const quickFilters = {
+    advButton: "Adventure",
+    boatButton: "Boat Trips", 
+    nightButton: "Nightlife",
+    fishButton: "Fishing Charters",
+    snorkelButton: "Snorkel Experiences",
+    culturalButt: "Cultural"
+  };
+  
+  Object.entries(quickFilters).forEach(([btnId, name]) => {
+    $w(`#${btnId}`).onClick(() => {
+      applyCategoryFilter([name]);
+    });
+  });
+
+  // --- Accordion checkboxes ---
+  const checkboxMap = {
+    "#islaCheck": "Isla Mujeres",
+    "#chichenCheck": "Chichenitza",
+    "#xcaretCheck": "Xcaret Collection", 
+    "#cocoCheck": "Coco bongo",
+    "#fullCheck": "Full Day",
+    "#halfCheck": "Half Day",
+    "#sightCheck": "Sightseeing",
+    "#culturalCheck": "Cultural",
+    "#gastroCheck": "Gastronomic Experiences",
+    "#adventureCheck": "Adventure",
+    "#honeyCheck": "Honeymoon Experiences",
+    "#fishCheck": "Fishing Charters",
+    "#boatCheck": "Boat Trips",
+    "#dolphinCheck": "Dolphins",
+    "#snorkelCheck": "Snorkel Experiences"
+  };
+  
+  $w("#applyButton").onClick(() => {
+    const selected = Object.entries(checkboxMap)
+      .filter(([sel, _]) => {
+        try {
+          return $w(sel).checked;
+        } catch (err) {
+          return false;
+        }
+      })
+      .map(([, name]) => name);
+    
+    applyCategoryFilter(selected);
+  });
+
+  $w("#removeFilter").onClick(() => {
+    applyCategoryFilter([]);
+  });
+
+  // --- Initial load ---
+  if (initialCategory && categoriesMap[initialCategory]) {
+    applyCategoryFilter([initialCategory]);
+  } else {
+    loadProducts();
+  }
+});
+
+// --- Filter Application ---
+function applyCategoryFilter(categoryNames) {
+  if (isLoading) return;
+  
+  // Clear search when applying category filters
+  currentFilters.searchTerm = "";
+  currentFilters.categoryNames = categoryNames;
+  
+  // Update UI
+  $w("#tourSearch").value = "";
+  updateCheckboxes();
+  
+  // Reset to page 1 and load
+  currentPage = 1;
+  loadProducts();
+}
+
+function updateCheckboxes() {
+  const checkboxMap = {
+    "#islaCheck": "Isla Mujeres",
+    "#chichenCheck": "Chichenitza",
+    "#xcaretCheck": "Xcaret Collection",
+    "#cocoCheck": "Coco bongo", 
+    "#fullCheck": "Full Day",
+    "#halfCheck": "Half Day",
+    "#sightCheck": "Sightseeing",
+    "#culturalCheck": "Cultural",
+    "#gastroCheck": "Gastronomic Experiences",
+    "#adventureCheck": "Adventure",
+    "#honeyCheck": "Honeymoon Experiences",
+    "#fishCheck": "Fishing Charters",
+    "#boatCheck": "Boat Trips",
+    "#dolphinCheck": "Dolphins",
+    "#snorkelCheck": "Snorkel Experiences"
+  };
+  
+  Object.entries(checkboxMap).forEach(([sel, name]) => {
+    try {
+      $w(sel).checked = currentFilters.categoryNames.includes(name);
+    } catch (err) {
+      // Handle missing checkboxes gracefully
+    }
+  });
+}
+
+// --- Main Load Function ---
+async function loadProducts() {
+  if (isLoading) return;
+  
+  isLoading = true;
+  disableFilterButtons(true);
+  $w("#productRepeater").collapse();
+  
+  // Check memory cache first
+  const cacheKey = getMemoryCacheKey(currentFilters, currentPage);
+  const cachedData = getMemoryCache(cacheKey);
+  
+  if (cachedData) {
+    // Use cached data
+    updateUI(cachedData.items, cachedData.totalCount);
+    isLoading = false;
+    disableFilterButtons(false);
+    prefetchNextPage();
+    return;
+  }
+  
+  try {
+    // Load fresh data
+    const results = await loadProductsFromAPI(currentPage);
+    updateUI(results.items, results.totalCount);
+    prefetchNextPage();
+  } catch (err) {
+    console.error("Error loading products:", err);
+  } finally {
+    isLoading = false;
+    disableFilterButtons(false);
+  }
+}
+
+// --- UI Update Functions ---
+function updateUI(items, totalCount) {
+  // Update pagination
+  updatePagination(totalCount);
+  
+  // Update repeater
+  $w("#productRepeater").data = items;
+  
+  // Update filter button state
+  const hasFilters = currentFilters.categoryNames.length > 0 || 
+                     currentFilters.searchTerm.length > 0;
+  
+  if (!hasFilters) {
+    $w("#removeFilter").label = `${totalCount} Excursions`;
+    $w("#removeFilter").disable();
+  } else {
+    $w("#removeFilter").label = "Remove Filters";
+    $w("#removeFilter").enable();
+  }
+  
+  // Show repeater
+  $w("#productRepeater").expand();
+}
+
+function updatePagination(totalItems) {
+  totalItemsCache = totalItems;
+  const totalPages = Math.max(1, Math.ceil(totalItems / itemsPerPage));
+  
+  $w("#pagination1").totalPages = totalPages;
+  $w("#pagination1").currentPage = currentPage;
+  
+  if (totalPages > 1) {
+    $w("#pagination1").expand();
+  } else {
+    $w("#pagination1").collapse();
+  }
+}
+
+function disableFilterButtons(state = true) {
+  const buttons = [
+    "#advButton", "#boatButton", "#nightButton",
+    "#fishButton", "#snorkelButton", "#culturalButt",
+    "#applyButton", "#removeFilter"
+  ];
+  
+  buttons.forEach(id => {
+    try {
+      $w(id)[state ? "disable" : "enable"]();
+    } catch (err) {
+      // Handle missing elements gracefully
+    }
+  });
+}
+
+// --- Repeater Binding ---
+$w("#productRepeater").onItemReady(($item, itemData) => {
+  try {
+    // Image
+    const imageSrc = itemData.mainMedia?.src || itemData.mediaItems?.[0]?.src || "";
+    if (imageSrc) {
+      $item("#tourImage").src = imageSrc;
+    }
+
+    // Title
+    $item("#tourTitle").text = itemData.name || "";
+
+    // Description
+    const rawDesc = (itemData.description || "").replace(/<[^>]*>/g, "");
+    const truncatedDesc = rawDesc.slice(0, 150);
+    $item("#tourDescription").html = `
+      <p style="font-family:Space Grotesk; font-size:18px;">
+        ${truncatedDesc}${truncatedDesc.length === 150 ? "…" : ""}
+      </p>`;
+
+    // Price
+    const priceNum = typeof itemData.price === 'number' 
+      ? itemData.price 
+      : parseFloat(itemData.price) || 0;
+    const priceEl = $item("#price");
+    priceEl.text = `$${Math.round(priceNum)} USD`;
+    priceEl.style.fontFamily = "Space Grotesk";
+    priceEl.style.fontSize = "26px";
+    priceEl.heading = 2;
+    priceEl.style.color = "#FFA500";
+
+    // Click handlers
+    const slug = itemData.slug;
+    const targetUrl = itemData.ribbon === "Fishing" 
+      ? `/charters/${slug}` 
+      : `/products/${slug}`;
+    
+    $item("#tourImage").onClick(() => wixLocation.to(targetUrl));
+    $item("#tourTitle").onClick(() => wixLocation.to(targetUrl));
+    
+  } catch (err) {
+    console.warn('Repeater item error:', err);
+  }
+});
