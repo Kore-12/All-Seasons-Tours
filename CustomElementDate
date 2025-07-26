@@ -1,0 +1,276 @@
+class DatePicker extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+
+    this.shadowRoot.innerHTML = `
+      <style>
+        :host {
+          display: inline-block;
+          position: relative;
+          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+          font-size: 16px;
+        }
+
+        * {
+          box-sizing: border-box;
+        }
+
+        #dateContainer {
+          position: relative;
+          text-align: center;
+          width: 100%;
+        }
+
+        #dateInput {
+          width: 250px; /* Similar to Passenger Picker */
+          padding: 10px 12px;
+          border: 1px solid #a5d6a7;
+          border-radius: 12px;
+          font-size: 16px; /* Matches Passenger Picker font size */
+          cursor: pointer;
+          outline: none;
+          text-align: center;
+        }
+
+        .calendar {
+          display: none;
+          position: absolute;
+          top: 100%;
+          left: 0;
+          margin-top: 8px;
+          width: 250px;
+          background: white;
+          border-radius: 12px;
+          box-shadow: 0 8px 16px rgba(0,0,0,0.15);
+          padding: 8px;
+          z-index: 1000;
+        }
+
+        .calendar.active {
+          display: block;
+        }
+
+        .calendar-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          font-weight: bold;
+          margin-bottom: 5px;
+          font-size: 15px;
+        }
+
+        .calendar-header div {
+          color: orange;
+        }
+
+        .calendar-header button {
+          border: none;
+          background: none;
+          font-size: 16px;
+          cursor: pointer;
+          padding: 2px 5px;
+          color: inherit;
+        }
+
+        .days-header, .days {
+          display: grid;
+          grid-template-columns: repeat(7, 1fr);
+          text-align: center;
+        }
+
+        .days-header div {
+          font-weight: bold;
+          padding: 4px;
+          font-size: 13px;
+          color: orange;
+        }
+
+        .days div {
+          position: relative;
+          padding: 10px 0;
+          font-size: 13px;
+          cursor: pointer;
+          transition: background-color 0.3s;
+        }
+
+        .days div.in-range::before {
+          content: "";
+          position: absolute;
+          top: 0;
+          left: 0;
+          width: 100%;
+          height: 100%;
+          background-color: rgba(76, 175, 80, 0.2);
+          z-index: -1;
+        }
+
+        .days div.start,
+        .days div.end {
+          background-color: #4caf50;
+          color: white;
+          border-radius: 50%;
+          z-index: 2;
+        }
+
+        .days div.start.in-range::before {
+          border-top-left-radius: 50%;
+          border-bottom-left-radius: 50%;
+          left: 50%;
+          width: 50%;
+        }
+
+        .days div.end.in-range::before {
+          border-top-right-radius: 50%;
+          border-bottom-right-radius: 50%;
+          width: 50%;
+        }
+
+        .days div:hover {
+          background-color: rgba(76, 175, 80, 0.1);
+        }
+      </style>
+
+      <div id="dateContainer">
+        <input type="text" id="dateInput" readonly placeholder="Arrival Date - Departure Date" />
+        <div class="calendar" id="calendar"></div>
+      </div>
+    `;
+
+    this.today = new Date();
+    this.currentMonth = this.today.getMonth();
+    this.currentYear = this.today.getFullYear();
+    this.startDate = null;
+    this.endDate = null;
+  }
+
+  connectedCallback() {
+    this.dateInput = this.shadowRoot.getElementById('dateInput');
+    this.calendarEl = this.shadowRoot.getElementById('calendar');
+
+    this.dateInput.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.calendarEl.classList.toggle('active');
+      this.currentMonth = this.startDate ? this.startDate.getMonth() : this.today.getMonth();
+      this.currentYear = this.startDate ? this.startDate.getFullYear() : this.today.getFullYear();
+      this.renderCalendar(this.currentMonth, this.currentYear);
+    });
+
+    document.addEventListener('click', () => {
+      this.calendarEl.classList.remove('active');
+    });
+  }
+
+  renderCalendar(month, year) {
+    this.calendarEl.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.className = 'calendar-header';
+
+    const prevBtn = document.createElement('button');
+    prevBtn.innerHTML = '&#10094;';
+    prevBtn.onclick = (e) => {
+      e.stopPropagation();
+      this.currentMonth--;
+      if (this.currentMonth < 0) {
+        this.currentMonth = 11;
+        this.currentYear--;
+      }
+      this.renderCalendar(this.currentMonth, this.currentYear);
+    };
+
+    const nextBtn = document.createElement('button');
+    nextBtn.innerHTML = '&#10095;';
+    nextBtn.onclick = (e) => {
+      e.stopPropagation();
+      this.currentMonth++;
+      if (this.currentMonth > 11) {
+        this.currentMonth = 0;
+        this.currentYear++;
+      }
+      this.renderCalendar(this.currentMonth, this.currentYear);
+    };
+
+    const monthYear = document.createElement('div');
+    monthYear.textContent = `${new Date(year, month).toLocaleString('en-US', { month: 'long' })} ${year}`;
+
+    header.appendChild(prevBtn);
+    header.appendChild(monthYear);
+    header.appendChild(nextBtn);
+    this.calendarEl.appendChild(header);
+
+    const daysHeader = document.createElement('div');
+    daysHeader.className = 'days-header';
+    ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].forEach(d => {
+      const day = document.createElement('div');
+      day.textContent = d;
+      daysHeader.appendChild(day);
+    });
+    this.calendarEl.appendChild(daysHeader);
+
+    const days = document.createElement('div');
+    days.className = 'days';
+    const firstDay = new Date(year, month, 1).getDay();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+    for (let i = 0; i < firstDay; i++) {
+      days.appendChild(document.createElement('div'));
+    }
+
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dayEl = document.createElement('div');
+      dayEl.textContent = day;
+      const date = new Date(year, month, day);
+
+      // Restored highlighting logic
+      if (this.startDate && this.isSameDate(date, this.startDate)) {
+        dayEl.classList.add('start');
+        if (this.endDate) dayEl.classList.add('in-range');
+      }
+      if (this.endDate && this.isSameDate(date, this.endDate)) {
+        dayEl.classList.add('end');
+        if (this.startDate) dayEl.classList.add('in-range');
+      }
+      if (this.startDate && this.endDate && date > this.startDate && date < this.endDate) {
+        dayEl.classList.add('in-range');
+      }
+
+      dayEl.onclick = (e) => {
+        e.stopPropagation();
+        this.selectDate(date);
+      };
+      days.appendChild(dayEl);
+    }
+    this.calendarEl.appendChild(days);
+  }
+
+  selectDate(date) {
+    if (!this.startDate || (this.startDate && this.endDate)) {
+      this.startDate = date;
+      this.endDate = null;
+    } else if (date < this.startDate) {
+      this.endDate = this.startDate;
+      this.startDate = date;
+    } else {
+      this.endDate = date;
+    }
+
+    this.dateInput.value = this.startDate && this.endDate
+      ? `${this.formatDate(this.startDate)} - ${this.formatDate(this.endDate)}`
+      : this.formatDate(this.startDate);
+
+    this.renderCalendar(this.currentMonth, this.currentYear);
+  }
+
+  isSameDate(d1, d2) {
+    return d1.getDate() === d2.getDate() &&
+           d1.getMonth() === d2.getMonth() &&
+           d1.getFullYear() === d2.getFullYear();
+  }
+
+  formatDate(date) {
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+}
+
+customElements.define('date-picker', DatePicker);
