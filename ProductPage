@@ -1,0 +1,706 @@
+import wixData from 'wix-data';
+import { product } from 'wix-stores-frontend';
+import wixEcomFrontend from 'wix-ecom-frontend';
+import { currentCart } from 'wix-ecom-backend';
+import wixWindow from 'wix-window';
+
+// Configuration: per-product quantity rules
+const productLimits = {
+    "Dolphin Couples": {
+        maxTotal: 2,
+        maxPerType: { adult: 1, child: 1, infant: 1 },
+        require: { adult: 1 }
+    }
+    // Add additional products here with their own limits
+};
+
+// Constants
+const WIX_STORES_APP_ID = "215238eb-22a5-4c36-9e7b-e7c08025e04e";
+const initialHideSelectors = [
+    '#timeSelect', '#durationOfTour', '#duration', '#selectTime',
+    '#hotelPickup', '#hotelInput', '#passenger', '#passengerSelect',
+    '#passengerRepeater', '#paxCount', '#total',
+    '#transportDisclaimer', '#priceTotal', '#addToCart', '#wixPay1',
+    '#validationError', '#successMessage', '#samedayError'
+];
+const debounceInterval = 300;
+const doneTypingInterval = 500;
+const descriptionMaxChars = 200;
+
+// Page state - declared outside onReady to avoid recreating these values
+let adultQuantity = 0;
+let childQuantity = 0;
+let infantQuantity = 0;
+let variantAdultPrice = 0;
+let variantChildPrice = 0;
+let variantInfantPrice = 0;
+let variantAdultId = null;
+let variantChildId = null;
+let variantInfantId = null;
+let fullDescription = '';
+let truncatedDescription = '';
+let descriptionExpanded = false;
+let hotelInputCompleted = false;
+let quantitiesApplied = false;
+let selectDebounceTimer = null;
+let typingTimer;
+let currentLimits = null;
+let selectedDate = null;
+let selectedTime = null;
+let selectedHotel = '';
+let selectedLocation = '';
+
+// Helper Functions - moved outside onReady for better performance
+function enforceLimits() {
+    if (!currentLimits) return;
+    const { maxTotal, maxPerType, require } = currentLimits;
+    const total = adultQuantity + childQuantity + infantQuantity;
+
+    // Enable all, then disable as needed
+    $w('#adultAdd').enable();
+    $w('#childAdd').enable();
+    $w('#infantAdd').enable();
+
+    if (adultQuantity >= (maxPerType.adult || Infinity) || total >= maxTotal) {
+        $w('#adultAdd').disable();
+    }
+    if (childQuantity >= (maxPerType.child || Infinity) || total >= maxTotal) {
+        $w('#childAdd').disable();
+    }
+    if (infantQuantity >= (maxPerType.infant || Infinity) || total >= maxTotal) {
+        $w('#infantAdd').disable();
+    }
+
+    // Enforce 'require' rules: e.g. must add adult before others
+    if (require?.adult && adultQuantity < require.adult) {
+        $w('#childAdd').disable();
+        $w('#infantAdd').disable();
+    }
+}
+
+function updatePassengerCounts() {
+    $w('#passengerAdult').text = adultQuantity.toString();
+    $w('#passengerChild').text = childQuantity.toString();
+    $w('#passengerInfant').text = infantQuantity.toString();
+    const total = adultQuantity + childQuantity + infantQuantity;
+    $w('#paxCount').text = `(${total} pax)`;
+    enforceLimits();
+}
+
+function formatPrice(price) {
+    return '$' + Math.round(price) + ' USD';
+}
+
+function formatPriceWithEach(price) {
+    return `<h1 style="font-family: 'Space Grotesk', sans-serif; margin: 0;">
+                <span style="font-family: 'Arial Black', sans-serif; color: #FF6A49;">
+                    $${Math.round(price)} USD
+                </span>
+                <span style="color: black; font-family: 'Space Grotesk', sans-serif;"> each</span>
+            </h1>`;
+}
+
+function isSameDay(date) {
+    if (!date) return false;
+    
+    const today = new Date();
+    return date.getDate() === today.getDate() && 
+           date.getMonth() === today.getMonth() && 
+           date.getFullYear() === today.getFullYear();
+}
+
+// DOM update functions - Optimize to batch updates where possible
+function updateDescription() {
+    const data = $w('#dynamicDataset').getCurrentItem();
+    fullDescription = data.description || '';
+    if (fullDescription.length > descriptionMaxChars) {
+        truncatedDescription = fullDescription.slice(0, descriptionMaxChars) + '...';
+        $w('#readMore').show();
+        $w('#readMore').label = 'Read More';
+    } else {
+        truncatedDescription = fullDescription;
+        $w('#readMore').hide();
+    }
+    $w('#description').html = `<div style="font-family: 'Space Grotesk', sans-serif; font-size: 18px; padding-bottom:5px;">${truncatedDescription}</div>`;
+    descriptionExpanded = false;
+}
+
+function showDateSelectedElements() {
+    $w('#samedayError').hide();
+    $w('#timeSelect').show();
+    $w('#durationOfTour').show();
+    $w('#duration').show();
+    $w('#selectTime').show();
+}
+
+function updateAccordion() {
+    const data = $w('#dynamicDataset').getCurrentItem();
+    if (!data) return;
+    
+    const sections = data.additionalInfoSections || [];
+    
+    // Create a function to find sections by title to avoid repeated array searches
+    const sectionMap = sections.reduce((map, section) => {
+        map[section.title] = section.description || '';
+        return map;
+    }, {});
+    
+    // Batch HTML updates and only show what's necessary
+    $w('#includedText').html = `<div style="font-size:18px;">${sectionMap['What does it include?'] || 'No include details.'}</div>`;
+    $w('#pleaseConsiderText').html = `<div style="font-size:18px;">${sectionMap['Please Consider'] || 'No consider details.'}</div>`;
+    $w('#moreInfoText').html = `<div style="font-size:18px;">${sectionMap['More information'] || 'No additional info.'}</div>`;
+
+    // Only expand sections that have content
+    if (sectionMap['Fleet Information']) {
+        $w('#fleetInfo').html = `<div style="font-size:18px;">${sectionMap['Fleet Information']}</div>`;
+        $w('#accordion2').expand();
+    } else {
+        $w('#accordion2').collapse();
+    }
+
+    if (sectionMap['What does it not Include?']) {
+        $w('#notIncludedInfo').html = `<div style="font-size:18px;">${sectionMap['What does it not Include?']}</div>`;
+        $w('#accordion3').expand();
+    } else {
+        $w('#accordion3').collapse();
+    }
+}
+
+function updateProductDisplay() {
+    const data = $w('#dynamicDataset').getCurrentItem();
+    if (!data) return;
+
+    // Batch DOM updates rather than doing them one at a time
+    $w('#tourName').text = data.name;
+    
+    let priceNum = data.price || parseFloat((data.formattedPrice||'').replace(/[^0-9.]/g, '')) || 0;
+    $w('#price').text = formatPrice(priceNum);
+
+    // Optimize gallery loading - only process what's needed
+    const galleryItems = [];
+    if (data.mainMedia) galleryItems.push({ src: data.mainMedia, type: 'image' });
+    
+    // Only add the first few media items to improve initial load time
+    const mediaItems = data.mediaItems || [];
+    const maxInitialImages = 3; // Limit initial images for faster loading
+    
+    for (let i = 0; i < Math.min(maxInitialImages, mediaItems.length); i++) {
+        const item = mediaItems[i];
+        if (item.src && item.src !== data.mainMedia) {
+            galleryItems.push({ src: item.src, type: 'image' });
+        }
+    }
+    
+    $w('#gallery1').items = galleryItems;
+
+    // Update text content
+    updateDescription();
+    updateAccordion();
+}
+
+function resetUI() {
+    // Batch hide operations for better performance
+    initialHideSelectors.forEach(sel => $w(sel).hide());
+    
+    // Batch collapse operations
+    $w('#accordion2').collapse();
+    $w('#accordion3').collapse();
+    $w('#locationSelect').collapse();
+    $w('#locationdropDown').disable();
+    $w('#locationdropDown').collapse();
+
+    // Reset state variables in one go
+    adultQuantity = childQuantity = infantQuantity = 0;
+    hotelInputCompleted = quantitiesApplied = false;
+    descriptionExpanded = false;
+    clearTimeout(typingTimer);
+    clearTimeout(selectDebounceTimer);
+    selectDebounceTimer = null;
+
+    // Reset selections
+    selectedDate = null;
+    selectedTime = null;
+    selectedHotel = '';
+    selectedLocation = '';
+
+    if (fullDescription) {
+        $w('#description').html = `<div style="font-family: 'Space Grotesk', sans-serif; font-size: 18px; padding-bottom:5px;">${truncatedDescription}</div>`;
+        $w('#readMore').label = 'Read More';
+    }
+
+    updatePassengerCounts();
+}
+
+// Optimized version that caches variant data
+let cachedVariantData = {};
+
+async function updatePassengerVariantPrices() {
+    const data = $w('#dynamicDataset').getCurrentItem();
+    if (!data) return;
+    
+    const timeValue = $w('#timeSelect').value;
+    const productId = data._id;
+    const cacheKey = `${productId}_${timeValue}`;
+    
+    // Check if we have cached data for this product/time combination
+    if (cachedVariantData[cacheKey]) {
+        const cached = cachedVariantData[cacheKey];
+        variantAdultId = cached.variantAdultId;
+        variantChildId = cached.variantChildId;
+        variantInfantId = cached.variantInfantId;
+        variantAdultPrice = cached.variantAdultPrice;
+        variantChildPrice = cached.variantChildPrice;
+        variantInfantPrice = cached.variantInfantPrice;
+        
+        // Update UI with cached values
+        updatePassengerRepeaterPrices(data);
+        return;
+    }
+    
+    // If not cached, fetch from API
+    const opts = { choices: { 'Start Time': timeValue } };
+    
+    try {
+        const vars = await product.getVariants(productId, opts);
+        const findType = t => vars.find(v => v.choices['Passenger Type']?.toLowerCase() === t);
+        
+        const adultVariant = findType('adult');
+        const childVariant = findType('child');
+        const infantVariant = findType('infant');
+        
+        // Store variant IDs for cart
+        variantAdultId = adultVariant?._id;
+        variantChildId = childVariant?._id;
+        variantInfantId = infantVariant?._id;
+        
+        // Store prices
+        variantAdultPrice = adultVariant?.variant.discountedPrice || adultVariant?.variant.price || 0;
+        variantChildPrice = childVariant?.variant.discountedPrice || childVariant?.variant.price || 0;
+        variantInfantPrice = infantVariant?.variant.discountedPrice || infantVariant?.variant.price || 0;
+        
+        // Cache the values
+        cachedVariantData[cacheKey] = {
+            variantAdultId,
+            variantChildId,
+            variantInfantId,
+            variantAdultPrice,
+            variantChildPrice,
+            variantInfantPrice
+        };
+        
+        // Update UI
+        updatePassengerRepeaterPrices(data);
+    } catch (err) {
+        console.error('Error fetching variants:', err);
+    }
+}
+
+function updatePassengerRepeaterPrices(data) {
+    $w('#passengerRepeater').forEachItem($item => {
+        $item('#adultPrice').html = formatPriceWithEach(variantAdultPrice);
+        
+        // Optimize by checking availability only once and storing results
+        const hasChildOption = data.productOptions?.['Passenger Type']?.choices?.some(x => 
+            x.value.toLowerCase() === 'child');
+        const hasInfantOption = data.productOptions?.['Passenger Type']?.choices?.some(x => 
+            x.value.toLowerCase() === 'infant');
+        
+        if (hasChildOption) {
+            $item('#childPrice').html = formatPriceWithEach(variantChildPrice);
+            $item('#childAdd').enable();
+            $item('#childSub').enable();
+        } else {
+            $item('#childPrice').text = 'Unavailable';
+            $item('#childAdd').disable();
+            $item('#childSub').disable();
+        }
+        
+        if (hasInfantOption) {
+            $item('#infantPrice').html = formatPriceWithEach(variantInfantPrice);
+            $item('#infantAdd').enable();
+            $item('#infantSub').enable();
+        } else {
+            $item('#infantPrice').text = 'Unavailable';
+            $item('#infantAdd').disable();
+            $item('#infantSub').disable();
+        }
+    });
+}
+
+// Function to prepare choices object for the cart
+function prepareChoices() {
+    const choices = {};
+    
+    // Only add choices that are actually selected
+    if (selectedTime) {
+        choices['Start Time'] = selectedTime;
+    }
+    
+    if (selectedLocation) {
+        choices['Location'] = selectedLocation;
+    }
+    
+    return choices;
+}
+
+// Optimized add to cart function
+async function addToCart() {
+    try {
+        const data = $w('#dynamicDataset').getCurrentItem();
+        if (!data) return;
+        
+        const totalPassengers = adultQuantity + childQuantity + infantQuantity;
+        if (totalPassengers === 0) return null;
+        
+        const lineItems = [];
+        const choices = prepareChoices();
+        
+        // Prepare custom fields for all items
+        const customTextFields = {
+            "Hotel": selectedHotel,
+            "Date": selectedDate ? selectedDate.toLocaleDateString() : ""
+        };
+        
+        // Build line items array - only adding items that have quantity > 0
+        if (adultQuantity > 0 && variantAdultId) {
+            lineItems.push({
+                catalogReference: {
+                    appId: WIX_STORES_APP_ID,
+                    catalogItemId: data._id,
+                    options: {
+                        variantId: variantAdultId,
+                        choices: choices,
+                        customTextFields: customTextFields
+                    },
+                },
+                quantity: adultQuantity
+            });
+        }
+        
+        if (childQuantity > 0 && variantChildId) {
+            lineItems.push({
+                catalogReference: {
+                    appId: WIX_STORES_APP_ID,
+                    catalogItemId: data._id,
+                    options: {
+                        variantId: variantChildId,
+                        choices: choices,
+                        customTextFields: customTextFields
+                    },
+                },
+                quantity: childQuantity
+            });
+        }
+        
+        if (infantQuantity > 0 && variantInfantId) {
+            lineItems.push({
+                catalogReference: {
+                    appId: WIX_STORES_APP_ID,
+                    catalogItemId: data._id,
+                    options: {
+                        variantId: variantInfantId,
+                        choices: choices,
+                        customTextFields: customTextFields
+                    },
+                },
+                quantity: infantQuantity
+            });
+        }
+        
+        // Only proceed if we have items to add
+        if (lineItems.length > 0) {
+            const options = { lineItems };
+            const updatedCart = await currentCart.addToCurrentCart(options);
+            console.log("Updated cart", updatedCart);
+            
+            // Open side cart to show the user what they've added
+            wixEcomFrontend.openSideCart();
+            wixEcomFrontend.refreshCart();
+            
+            return updatedCart;
+        } else {
+            console.warn("No items to add to cart");
+            return null;
+        }
+    } catch (error) {
+        console.error("Error adding to cart:", error);
+        throw error;
+    }
+}
+
+// Setup efficient validation to avoid unnecessary error messages
+function validateBookingSelections() {
+    if (!selectedDate) {
+        return { valid: false, message: "Please select a date" };
+    }
+    if (isSameDay(selectedDate)) {
+        return { valid: false, message: "Same day booking is not available" };
+    }
+    if (!selectedTime) {
+        return { valid: false, message: "Please select a time" };
+    }
+    if (!selectedHotel) {
+        return { valid: false, message: "Please enter hotel information" };
+    }
+    
+    const totalPassengers = adultQuantity + childQuantity + infantQuantity;
+    if (totalPassengers === 0) {
+        return { valid: false, message: "Please select at least one passenger" };
+    }
+    
+    return { valid: true, message: "" };
+}
+
+// Main initialization
+$w.onReady(() => {
+    // Initially hide UI elements - batching operations
+    initialHideSelectors.forEach(sel => $w(sel).hide());
+    
+    // Batch collapse operations
+    $w('#accordion2').collapse();
+    $w('#accordion3').collapse();
+    $w('#locationSelect').collapse();
+    $w('#locationdropDown').disable();
+    $w('#locationdropDown').collapse();
+
+    // --- Dataset Events ---
+    $w('#dynamicDataset').onReady(() => {
+        const data = $w('#dynamicDataset').getCurrentItem();
+        if (!data) return;
+        
+        currentLimits = productLimits[data.name] || null;
+        // Defer non-critical UI updates
+        setTimeout(() => {
+            updateProductDisplay();
+        }, 10);
+    });
+
+    $w('#dynamicDataset').onCurrentIndexChanged(() => {
+        const data = $w('#dynamicDataset').getCurrentItem();
+        if (!data) return;
+        
+        currentLimits = productLimits[data.name] || null;
+        resetUI();
+        updateProductDisplay();
+    });
+
+    // --- UI Handlers ---
+    $w('#calenderSelect').onChange(() => {
+        selectedDate = $w('#calenderSelect').value;
+        
+        // Check if selected date is today
+        if (isSameDay(selectedDate)) {
+            // Hide all booking elements
+            initialHideSelectors.forEach(sel => {
+                if (sel !== '#samedayError') {
+                    $w(sel).hide();
+                }
+            });
+            
+            // Show same day error message
+            $w('#samedayError').show();
+            
+            // Reset selections that should not apply for same-day
+            selectedTime = null;
+            selectedHotel = '';
+            selectedLocation = '';
+            adultQuantity = childQuantity = infantQuantity = 0;
+            hotelInputCompleted = quantitiesApplied = false;
+            
+            // Make sure these panels are collapsed
+            $w('#locationSelect').collapse();
+            $w('#locationdropDown').collapse();
+        } else {
+            // For any other date, proceed normally
+            showDateSelectedElements();
+            const data = $w('#dynamicDataset').getCurrentItem();
+            const dur = data.additionalInfoSections?.find(s => s.title === 'Duration');
+            if (dur) $w('#duration').text = dur.description.replace(/<[^>]*>/g, '');
+            
+            // Optimize dropdown options creation
+            const opts = data.productOptions?.['Start Time']?.choices || [];
+            const timeOptions = opts.map(o => ({ label: o.description, value: o.value }));
+            $w('#timeSelect').options = timeOptions;
+        }
+    });
+
+    $w('#timeSelect').onChange(() => {
+        selectedTime = $w('#timeSelect').value;
+        
+        // Batch show operations
+        $w('#hotelPickup').show();
+        $w('#hotelInput').show();
+        $w('#locationSelect').expand();
+        
+        const data = $w('#dynamicDataset').getCurrentItem();
+        const locOpts = data.productOptions?.['Location']?.choices || [];
+        
+        if (locOpts.length) {
+            // Create options array once, not in a loop
+            const locationOptions = locOpts.map(o => ({ 
+                label: o.description, 
+                value: o.value 
+            }));
+            
+            $w('#locationdropDown').options = locationOptions;
+            $w('#locationdropDown').enable();
+            $w('#locationdropDown').expand();
+        } else {
+            $w('#locationdropDown').disable();
+            $w('#locationdropDown').expand();
+        }
+    });
+
+    $w('#locationdropDown').onChange(() => {
+        selectedLocation = $w('#locationdropDown').value;
+    });
+
+    $w('#hotelInput').onInput(() => {
+        selectedHotel = $w('#hotelInput').value;
+        if (hotelInputCompleted) return;
+        
+        // Hide elements in one batch operation
+        const hideElements = ['#passenger', '#passengerSelect', '#passengerRepeater'];
+        hideElements.forEach(sel => $w(sel).hide());
+        
+        clearTimeout(typingTimer);
+        typingTimer = setTimeout(() => {
+            if ($w('#hotelInput').value.trim()) {
+                // Show elements in one batch operation
+                hideElements.forEach(sel => $w(sel).show());
+                updatePassengerVariantPrices();
+                hotelInputCompleted = true;
+            }
+        }, doneTypingInterval);
+    });
+
+    // Passenger quantity buttons - use the same handler for all buttons
+    function handleQuantityChange(type, increment) {
+        switch(type) {
+            case 'adult':
+                adultQuantity = Math.max(0, adultQuantity + increment);
+                break;
+            case 'child':
+                childQuantity = Math.max(0, childQuantity + increment);
+                break;
+            case 'infant':
+                infantQuantity = Math.max(0, infantQuantity + increment);
+                break;
+        }
+        updatePassengerCounts();
+    }
+
+    $w('#adultAdd').onClick(() => handleQuantityChange('adult', 1));
+    $w('#adultSub').onClick(() => handleQuantityChange('adult', -1));
+    $w('#childAdd').onClick(() => handleQuantityChange('child', 1));
+    $w('#childSub').onClick(() => handleQuantityChange('child', -1));
+    $w('#infantAdd').onClick(() => handleQuantityChange('infant', 1));
+    $w('#infantSub').onClick(() => handleQuantityChange('infant', -1));
+
+    $w('#applyButton').onClick(() => {
+        $w('#passengerRepeater').hide();
+        
+        // Build passenger text efficiently
+        const parts = [];
+        if (adultQuantity) parts.push(`${adultQuantity} Adult${adultQuantity>1?'s':''}`);
+        if (childQuantity) parts.push(`${childQuantity} Child${childQuantity>1?'ren':''}`);
+        if (infantQuantity) parts.push(`${infantQuantity} Infant${infantQuantity>1?'s':''}`);
+        
+        let passengerText = 'None selected';
+        if (parts.length === 1) {
+            passengerText = parts[0];
+        } else if (parts.length === 2) {
+            passengerText = parts.join(' and ');
+        } else if (parts.length > 2) {
+            passengerText = parts.join(', ');
+        }
+        
+        $w('#passengerSelect').placeholder = passengerText;
+        
+        // Calculate total price
+        const totalPrice = adultQuantity*variantAdultPrice + childQuantity*variantChildPrice + infantQuantity*variantInfantPrice;
+        $w('#priceTotal').text = formatPrice(totalPrice);
+        
+        if (!quantitiesApplied) {
+            // Show all elements at once
+            ['#paxCount','#total','#transportDisclaimer','#priceTotal','#addToCart','#wixPay1'].forEach(sel => $w(sel).show());
+            quantitiesApplied = true;
+        }
+    });
+
+    $w('#passengerSelect').onClick(() => {
+        if (!selectDebounceTimer) {
+            selectDebounceTimer = setTimeout(() => {
+                $w('#passengerRepeater').show();
+                selectDebounceTimer = null;
+            }, debounceInterval);
+        }
+    });
+
+    $w('#readMore').onClick(() => {
+        if (!descriptionExpanded) {
+            $w('#description').html = `<div style="font-family: 'Space Grotesk', sans-serif; font-size: 18px; padding-bottom:5px;">${fullDescription}</div>`;
+            $w('#readMore').label = 'Read Less';
+        } else {
+            $w('#description').html = `<div style="font-family: 'Space Grotesk', sans-serif; font-size: 18px; padding-bottom:5px;">${truncatedDescription}</div>`;
+            $w('#readMore').label = 'Read More';
+        }
+        descriptionExpanded = !descriptionExpanded;
+    });
+
+    // Add to cart button handler
+    $w('#addToCart').onClick(async () => {
+        try {
+            // Validate selections efficiently
+            const validation = validateBookingSelections();
+            if (!validation.valid) {
+                $w('#validationError').text = validation.message;
+                $w('#validationError').show();
+                return;
+            }
+            
+            // Hide any previous validation errors
+            $w('#validationError').hide();
+            
+            // Disable button to prevent double clicks
+            $w('#addToCart').disable();
+            
+            // Add to cart
+            await addToCart();
+            
+            // Re-enable button
+            $w('#addToCart').enable();
+            
+            // Show success message
+            $w('#successMessage').text = "Tour added to cart successfully!";
+            $w('#successMessage').show();
+            
+            // Hide success message after 3 seconds
+            setTimeout(() => {
+                $w('#successMessage').hide();
+            }, 3000);
+        } catch (error) {
+            console.error("Error in add to cart flow:", error);
+            $w('#addToCart').enable();
+            $w('#validationError').text = "There was an error adding to cart. Please try again.";
+            $w('#validationError').show();
+        }
+    });
+
+    // Checkout button handler
+    $w('#wixPay1').onClick(async () => {
+        try {
+            // First add to cart if needed
+            if (adultQuantity + childQuantity + infantQuantity > 0) {
+                await addToCart();
+            }
+            
+            // Redirect to checkout
+            wixEcomFrontend.checkout();
+        } catch (error) {
+            console.error("Error proceeding to checkout:", error);
+            $w('#validationError').text = "There was an error proceeding to checkout. Please try again.";
+            $w('#validationError').show();
+        }
+    });
+});
