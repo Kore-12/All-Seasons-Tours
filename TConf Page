@@ -1,0 +1,377 @@
+// Booking Details / Transport Confirmation Page
+import wixLocation from 'wix-location';
+import wixData from 'wix-data';
+import { product } from 'wix-stores-frontend';
+import wixEcomFrontend from 'wix-ecom-frontend';
+import { addToCart, createCheckout } from 'backend/cart.web';
+
+const WIX_STORES_APP_ID = '215238eb-22a5-4c36-9e7b-e7c08025e04e';
+
+/* ───────── State ───────── */
+let type='', tripType='', passengers='', airport='', dateStr='', hotel='', price='', productName='', productId='', itemsCount=1;
+let arrivalInfo='', departureInfo=''; let arrivalConfirmed=false, departureConfirmed=false;
+let addonSelections=[]; // [{productId, variantId, choiceName, price, currency, quantity}, ...]
+
+/* Add-on categories mapped to product names + option name */
+const ADDONS_BY_NAME = [
+  { title:'Soft Drinks',             productNames:['Soft Drinks'], optionName:'Soft Drinks' },
+  { title:'Beer',                    productNames:['Beer'],        optionName:'Beer' },
+  { title:'Tequila',                 productNames:['Tequila'],     optionName:'Tequila' },
+  { title:'Child Car Seat',          productNames:['Child Car Seat'], optionName:'Car Seat' }, // courtesy
+  { title:'Repellents and Sunblock', productNames:['Repellents and Sun Block','Repellents and Sunblock'], optionName:'Self Care' }
+];
+
+/* ───────── Helpers ───────── */
+function markBorder(sel, ok){ try{ $w(sel).style.borderColor = ok ? 'rgba(0,0,0,0)' : '#FF0000'; }catch{} }
+function parseISOish(s){ if(!s) return null; const t=String(s).trim(); let d=new Date(t); if(!isNaN(d.getTime())) return d;
+  if(t.includes('-')){const [y,m,dy]=t.split('-').map(n=>parseInt(n,10)); d=new Date(y,(m||1)-1,dy||1); if(!isNaN(d.getTime())) return d;}
+  if(t.includes('/')){const [a,b,c]=t.split('/').map(n=>parseInt(n,10)); d=new Date(c,(a||1)-1,b||1); if(!isNaN(d.getTime())) return d; d=new Date(c,(b||1)-1,a||1); if(!isNaN(d.getTime())) return d;}
+  return null; }
+function fmt(d){ if(!d||isNaN(d.getTime())) return '—'; return d.toLocaleDateString('en-US',{year:'numeric',month:'short',day:'numeric'}); }
+function parseDates(ds,tt){ if(!ds) return {startDate:null,endDate:null,prettyText:'—'}; let a=ds.trim(), b=null; const sep=' - '; if(tt==='Round Trip'&&ds.includes(sep)){[a,b]=ds.split(sep);} const s=parseISOish(a), e=b?parseISOish(b):null;
+  return {startDate:s,endDate:e,prettyText:(tt==='Round Trip'&&e)?`${fmt(s)} - ${fmt(e)}`:fmt(s)}; }
+function compileFlightInfo(){ const hasA=arrivalConfirmed&&arrivalInfo.trim(); const hasD=departureConfirmed&&departureInfo.trim();
+  if(tripType==='Round Trip') return `Arrival: ${hasA?arrivalInfo:'—'} | Departure: ${hasD?departureInfo:'—'}`;
+  if(tripType==='Airport-Hotel') return `Arrival: ${hasA?arrivalInfo:'—'}`;
+  if(tripType==='Hotel-Airport') return `Departure: ${hasD?departureInfo:'—'}`;
+  return `${arrivalInfo||''} ${departureInfo||''}`.trim(); }
+function buildDatePassengersText(){ const {prettyText}=parseDates(dateStr,tripType); const pax=(passengers||'—').toString().trim()||'—'; return `Date(s): ${prettyText} | Passengers: ${pax}`; }
+function canCheckoutNow(){ if(tripType==='Round Trip') return arrivalConfirmed&&departureConfirmed; if(tripType==='Airport-Hotel') return arrivalConfirmed; if(tripType==='Hotel-Airport') return departureConfirmed; return false; }
+
+// $$$ format: "$9.00 USD"
+function money(amount, currency='USD'){
+  const n = Number(amount)||0;
+  return `$${n.toFixed(2)} ${currency}`;
+}
+// Parse "USD 120.00", "$120.00 USD", "$120", "120.00"
+function parseMoney(text){
+  const s = (text ?? '').toString().trim();
+  if (!s) return { amount:0, currency:'USD' };
+  // "$120.00 USD"
+  const both = s.match(/^\$?([0-9.,]+)\s+([A-Za-z]{3})$/);
+  if (both) return { amount: Number(both[1].replace(/,/g,''))||0, currency: both[2] };
+  // "USD 120.00"
+  const curFirst = s.match(/^([A-Za-z]{3})\s+([0-9.,]+)/);
+  if (curFirst) return { amount: Number(curFirst[2].replace(/,/g,''))||0, currency: curFirst[1] };
+  // "$120.00" or "120.00"
+  const numOnly = s.match(/([0-9]+(?:[.,][0-9]{1,2})?)/);
+  const amount = numOnly ? Number(numOnly[1].replace(/,/g,''))||0 : 0;
+  return { amount, currency:'USD' };
+}
+
+/* ───────── Add-ons catalog builder with robust extractors ───────── */
+async function findProductIdByNames(names=[]) {
+  for (const nm of names) {
+    try {
+      let r = await wixData.query('Stores/Products').eq('name', nm).limit(1).find();
+      if (r?.items?.length) return r.items[0]._id;
+      r = await wixData.query('Stores/Products').contains('name', nm).limit(5).find();
+      if (r?.items?.length) {
+        const exact = r.items.find(p => String(p.name||'').toLowerCase() === nm.toLowerCase());
+        return (exact || r.items[0])._id;
+      }
+    } catch (e) { console.warn('[Add-ons] query error', nm, e); }
+  }
+  return '';
+}
+
+function extractVariantPriceCurrency(v){
+  const p1 = v?.variant?.discountedPrice;
+  const p2 = v?.variant?.price;
+  const p3 = v?.priceData?.price?.amount;
+  const price = [p1,p2,p3].find(x => typeof x === 'number' && !isNaN(x)) ?? 0;
+
+  const c1 = v?.priceData?.price?.currency;
+  const c2 = v?.variant?.currency;
+  const currency = c1 || c2 || 'USD';
+  return { price, currency };
+}
+function extractVariantImage(v){
+  const i1 = v?.variant?.media?.mainMedia?.image?.url;
+  const i2 = v?.media?.mainMedia?.image?.url;
+  const i3 = v?.image?.url;
+  const i4 = Array.isArray(v?.media?.items) ? v.media.items.find(m=>m?.image?.url)?.image?.url : undefined;
+  const i5 = v?.variant?.image?.url;
+  return i1 || i2 || i3 || i4 || i5 || '';
+}
+function extractChoiceName(v, optionName){
+  if (Array.isArray(v?.choices)) {
+    const found = v.choices.find(c => (c?.option?.name || c?.optionName) === optionName);
+    return found?.selection || found?.value || '';
+  }
+  if (v?.choices?.[optionName]) return v.choices[optionName];
+  if (v?.choicesMap?.[optionName]) return v.choicesMap[optionName];
+  return v?.variantName || v?.name || '(Option)';
+}
+
+async function buildAddonsCatalog(){
+  const cats=[]; let siteCurrency='USD';
+
+  for (const def of ADDONS_BY_NAME) {
+    const pid = await findProductIdByNames(def.productNames);
+    if (!pid) { console.warn('[Add-ons] not found:', def.title); continue; }
+
+    let variants=[];
+    try { variants = await product.getVariants(pid); }
+    catch(e){ console.warn('[Add-ons] getVariants failed', def.title, e); continue; }
+
+    const items = variants.map(v=>{
+      const { price, currency } = extractVariantPriceCurrency(v);
+      const image = extractVariantImage(v);
+      siteCurrency = siteCurrency || currency;
+      return {
+        productId: pid,
+        variantId: v._id,
+        optionName: def.optionName,
+        choiceName: extractChoiceName(v, def.optionName),
+        price: Number(price)||0,
+        currency: currency || 'USD',
+        image
+      };
+    });
+
+    const uniq = new Map();
+    for (const it of items) uniq.set(`${it.choiceName}::${it.variantId}`, it);
+
+    cats.push({ title:def.title, optionName:def.optionName, items:[...uniq.values()] });
+  }
+
+  if (!cats.length) return null;
+  const flat = cats.flatMap(c=>c.items);
+  const firstCurrency = (flat.find(i=>i.currency)?.currency) || siteCurrency || 'USD';
+  return { currency:firstCurrency, categories:cats };
+}
+
+/* ───────── Bridge to the Custom Element ───────── */
+function wireAddonsEvents(comp, nativeEl){
+  const handle = (payload)=>{
+    try {
+      const detail = (payload && payload.detail) || payload;
+      addonSelections = Array.isArray(detail?.selections) ? detail.selections : [];
+    } catch { addonSelections = []; }
+    try { refreshCartRepeater(); } catch(e){ console.warn('refreshCartRepeater failed', e); }
+    try { refreshTotalItemsLabel(); } catch(e){}
+    try { sumTotals(); } catch(e){}
+  };
+  if (comp && typeof comp.on === 'function') { try{ comp.on('addonsChanged', handle); return; }catch{} }
+  if (nativeEl) nativeEl.addEventListener('addonsChanged', ev=>handle(ev));
+}
+function setCatalogOnCE(comp, nativeEl, catalog){
+  const safe = catalog || { currency:'USD', categories:[] };
+  if (comp && typeof comp.setAttribute === 'function') { try{ comp.setAttribute('data-catalog', JSON.stringify(safe)); return; }catch{} }
+  if (nativeEl) { try{ nativeEl.catalog = safe; }catch(e){ console.warn('[Add-ons] native set failed', e); } }
+}
+
+/* ───────── Repeater (#cartItems with #cartItem, #itemPrice) ───────── */
+function baseLine(){
+  const name = productName || (type==='deluxe' ? 'Deluxe Private Airport Transportation' : 'Private Airport Transportation');
+  const { amount, currency } = parseMoney(price);
+  return { _id:'base-transfer', text:name, priceText: money(amount, currency||'USD') };
+}
+function addonLine(sel){
+  const qty = Math.max(1, Number(sel.quantity)||0);
+  const subTotal = (Number(sel.price)||0) * qty;
+  return {
+    _id: `sel-${sel.productId}::${sel.variantId}`,
+    text: sel.choiceName,
+    priceText: sel.price > 0 ? money(subTotal, sel.currency||'USD') : 'Courtesy'
+  };
+}
+function buildData(){ return [baseLine(), ...addonSelections.map(addonLine)]; }
+
+function bindCartRepeater(){
+  try {
+    $w('#cartItems').onItemReady(($item, itemData) => {
+      try { $item('#cartItem').text = itemData.text || ''; } catch {}
+      try {
+        $item('#itemPrice').text = itemData.priceText || '';
+        $item('#itemPrice').style.color = '#16a34a'; // force green
+      } catch {}
+    });
+  } catch {}
+}
+
+function sameIdSets(a, b){
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  const A = new Set(a.map(x=>x._id));
+  for (const it of b) if (!A.has(it._id)) return false;
+  return true;
+}
+
+function refreshCartRepeater(){
+  const newData = buildData();
+  const oldData = (()=>{ try { return $w('#cartItems').data || []; } catch { return []; } })();
+
+  if (!sameIdSets(oldData, newData)) {
+    try { $w('#cartItems').data = newData; } catch {}
+    return;
+  }
+
+  const byId = new Map(newData.map(d => [d._id, d]));
+  try {
+    $w('#cartItems').forEachItem(($item, itemData) => {
+      const d = byId.get(itemData._id);
+      if (!d) return;
+      try { if ($item('#cartItem').text !== d.text) $item('#cartItem').text = d.text; } catch {}
+      try {
+        if ($item('#itemPrice').text !== d.priceText) $item('#itemPrice').text = d.priceText;
+        $item('#itemPrice').style.color = '#16a34a'; // keep green on live updates
+      } catch {}
+    });
+  } catch {}
+}
+
+function refreshTotalItemsLabel(){
+  const totalLines = 1 + addonSelections.length;
+  try { $w('#totalItems').text = `Total (${totalLines} item${totalLines!==1?'s':''})`; } catch {}
+}
+
+/* === Grand total including add-ons × quantities, in "$9.00 USD" === */
+function sumTotals(){
+  const { amount: baseAmount, currency: baseCurrency } = parseMoney(price);
+  const baseQty = Math.max(1, Number(itemsCount)||1);
+  let total = baseAmount * baseQty;
+  let currency = baseCurrency || 'USD';
+
+  for (const sel of addonSelections){
+    const qty = Math.max(1, Number(sel.quantity)||0);
+    total += (Number(sel.price)||0) * qty;
+    if (!currency && sel.currency) currency = sel.currency;
+  }
+  try { $w('#totalPrice').text = money(total, currency||'USD'); } catch {}
+}
+
+/* ───────── Line items (base + add-ons) ───────── */
+function addonLineItems(){
+  if (!addonSelections.length) return [];
+  return addonSelections.map(sel=>({
+    catalogReference:{ appId:WIX_STORES_APP_ID, catalogItemId:sel.productId, options:{ variantId: sel.variantId } },
+    quantity: Math.max(1, Math.min(99, Number(sel.quantity||0)))
+  }));
+}
+async function buildLineItemsForCart(){
+  if (!productId) throw new Error('Missing productId');
+  const vars = await product.getVariants(productId, { choices:{ 'Trip Type':tripType, 'Airport':airport, 'Hotel':hotel } });
+  if (!vars?.length) throw new Error('Variant not found');
+  const v = vars[0];
+
+  const transferItem = {
+    catalogReference:{
+      appId: WIX_STORES_APP_ID,
+      catalogItemId: productId,
+      options:{
+        variantId: v._id,
+        choices:{ 'Trip Type':tripType, 'Airport':airport, 'Hotel':hotel },
+        customTextFields:{ 'Flight Info': compileFlightInfo(), 'Date & Passengers': buildDatePassengersText() }
+      }
+    },
+    quantity:1
+  };
+  return [transferItem, ...addonLineItems()];
+}
+async function addTransferToCartAndRefreshUI(){
+  const lineItems = await buildLineItemsForCart();
+  const updated = await addToCart({ lineItems });
+  try{ await wixEcomFrontend.refreshCart(); }catch{}
+  return updated;
+}
+function setActionButtonsEnabled(on){ try{ on ? $w('#addToCart').enable() : $w('#addToCart').disable(); }catch{} try{ on ? $w('#transferCheckout').enable() : $w('#transferCheckout').disable(); }catch{} }
+
+/* ───────── Flight info accordions (unchanged) ───────── */
+function setupRoundTrip(){
+  $w('#arrivalDrop').collapse(); $w('#departureDrop').collapse(); setActionButtonsEnabled(false);
+  $w('#arrivalContainer').onClick(()=>{ $w('#arrivalDrop').collapsed ? $w('#arrivalDrop').expand() : $w('#arrivalDrop').collapse(); });
+  $w('#departureContainer').onClick(()=>{ $w('#departureDrop').collapsed ? $w('#departureDrop').expand() : $w('#departureDrop').collapse(); });
+  $w('#confirmArrival').onClick(()=>{ const a=$w('#AAirline').value.trim(); const f=$w('#AFlight').value.trim(); const aOk=!!a,fOk=!!f; markBorder('#AAirline',aOk); markBorder('#AFlight',fOk); if(!aOk||!fOk)return; arrivalInfo=`${a} | ${f}`; arrivalConfirmed=true; $w('#arrivalPlace').text=arrivalInfo; $w('#arrivalDrop').collapse(); setActionButtonsEnabled(canCheckoutNow()); });
+  $w('#confirmDeparture').onClick(()=>{ const a=$w('#BAirline').value.trim(); const f=$w('#BFlight').value.trim(); const aOk=!!a,fOk=!!f; markBorder('#BAirline',aOk); markBorder('#BFlight',fOk); if(!aOk||!fOk)return; departureInfo=`${a} | ${f}`; departureConfirmed=true; $w('#departurePlace').text=departureInfo; $w('#departureDrop').collapse(); setActionButtonsEnabled(canCheckoutNow()); });
+  $w('#AAirline').onInput(()=>{ arrivalConfirmed=false; setActionButtonsEnabled(false); });
+  $w('#AFlight').onInput(()=> { arrivalConfirmed=false; setActionButtonsEnabled(false); });
+  $w('#BAirline').onInput(()=>{ departureConfirmed=false; setActionButtonsEnabled(false); });
+  $w('#BFlight').onInput(()=> { departureConfirmed=false; setActionButtonsEnabled(false); });
+}
+function setupHotelAirport(){
+  $w('#departureDrop2').collapse(); arrivalConfirmed=true; departureConfirmed=false; setActionButtonsEnabled(false);
+  $w('#departureContainer2').onClick(()=>{ $w('#departureDrop2').collapsed ? $w('#departureDrop2').expand() : $w('#departureDrop2').collapse(); });
+  $w('#departureConfirm2').onClick(()=>{ const a=$w('#BAirline2').value.trim(); const f=$w('#BFlight2').value.trim(); const aOk=!!a,fOk=!!f; markBorder('#BAirline2',aOk); markBorder('#BFlight2',fOk); if(!aOk||!fOk)return; departureInfo=`${a} | ${f}`; departureConfirmed=true; $w('#departurePlace2').text=departureInfo; $w('#departureDrop2').collapse(); setActionButtonsEnabled(canCheckoutNow()); });
+  $w('#BAirline2').onInput(()=>{ departureConfirmed=false; setActionButtonsEnabled(false); });
+  $w('#BFlight2').onInput(()=> { departureConfirmed=false; setActionButtonsEnabled(false); });
+}
+function setupAirportHotel(){
+  $w('#arrivalDrop2').collapse(); departureConfirmed=true; arrivalConfirmed=false; setActionButtonsEnabled(false);
+  $w('#arrivalContainer2').onClick(()=>{ $w('#arrivalDrop2').collapsed ? $w('#arrivalDrop2').expand() : $w('#arrivalDrop2').collapse(); });
+  $w('#arrivalConfirm2').onClick(()=>{ const a=$w('#AAirline2').value.trim(); const f=$w('#AFlight2').value.trim(); const aOk=!!a,fOk=!!f; markBorder('#AAirline2',aOk); markBorder('#AFlight2',fOk); if(!aOk||!fOk)return; arrivalInfo=`${a} | ${f}`; arrivalConfirmed=true; $w('#arrivalPlace2').text=arrivalInfo; $w('#arrivalDrop2').collapse(); setActionButtonsEnabled(canCheckoutNow()); });
+  $w('#AAirline2').onInput(()=>{ arrivalConfirmed=false; setActionButtonsEnabled(false); });
+  $w('#AFlight2').onInput(()=> { arrivalConfirmed=false; setActionButtonsEnabled(false); });
+}
+
+/* ───────── onReady ───────── */
+$w.onReady(async ()=>{
+  try{$w('#suburbanImage').hide();$w('#toyotaImage').hide();}catch{}
+  const q=wixLocation.query;
+  type=q.type||''; tripType=q.tripType||''; passengers=q.passengers||''; airport=q.airport||''; dateStr=q.date||''; hotel=q.hotel||''; price=q.price||''; productName=q.productName||''; productId=q.productId||''; itemsCount=Number(q.items||'1')||1;
+
+  const {prettyText}=parseDates(dateStr,tripType);
+  try{
+    $w('#bookingInfo').text=`${tripType} | ${passengers} | ${airport} | ${prettyText} | ${hotel}`;
+    // total filled by sumTotals()
+    if(type==='private') $w('#toyotaImage').show();
+    if(type==='deluxe')  $w('#suburbanImage').show();
+  }catch{}
+
+  bindCartRepeater();
+  refreshCartRepeater();
+  refreshTotalItemsLabel();
+  sumTotals();
+
+  const tt=(tripType||'').trim();
+  if(tt==='Hotel-Airport'){ await $w('#flightInfoBox').changeState('hotelAirport'); setupHotelAirport(); }
+  else if(tt==='Airport-Hotel'){ await $w('#flightInfoBox').changeState('airportHotel'); setupAirportHotel(); }
+  else { await $w('#flightInfoBox').changeState('roundTrip'); setupRoundTrip(); }
+
+  try{
+    $w('#modifyButton').onClick(()=>{
+      const params={ tripType, airport, hotel, date:dateStr, passengers, from:'modify' };
+      const qs=Object.entries(params).map(([k,v])=>`${k}=${encodeURIComponent(v??'')}`).join('&');
+      wixLocation.to(`/transportation?${qs}`);
+    });
+  }catch{}
+
+  // Add-ons CE hookup
+  try{
+    const catalogPromise = buildAddonsCatalog();
+    let comp=null, nativeEl=null;
+    try{ comp=$w('#addonsCE'); }catch{}
+    if(comp && typeof comp.getCustomElement==='function'){ try{ nativeEl=comp.getCustomElement(); }catch{} }
+    if(!comp && !nativeEl){
+      console.warn('[Add-ons] CE "#addonsCE" not found or not a Custom Element.');
+    }else{
+      wireAddonsEvents(comp, nativeEl);
+      const catalog = await catalogPromise;
+      setCatalogOnCE(comp, nativeEl, catalog);
+    }
+  }catch(e){ console.warn('[Add-ons] init failed:', e); }
+
+  try{
+    $w('#addToCart').onClick(async ()=>{
+      if(!canCheckoutNow()) return;
+      try{
+        $w('#addToCart').disable();
+        await addTransferToCartAndRefreshUI();
+        try{ await wixEcomFrontend.openSideCart(); }catch{ try{ await wixEcomFrontend.openCartPanel(); }catch{} }
+      }catch(err){ wixLocation.to('/cart'); } finally{ $w('#addToCart').enable(); }
+    });
+  }catch{}
+  try{
+    $w('#transferCheckout').onClick(async ()=>{
+      if(!canCheckoutNow()) return;
+      try{
+        $w('#transferCheckout').disable();
+        await addTransferToCartAndRefreshUI();
+        const { checkoutId } = await createCheckout({ channelType:'WEB' });
+        await wixEcomFrontend.navigateToCheckoutPage(checkoutId);
+      }catch(err){ try{ await wixEcomFrontend.openSideCart(); }catch{ wixLocation.to('/checkout'); } }
+      finally{ $w('#transferCheckout').enable(); }
+    });
+  }catch{}
+});
