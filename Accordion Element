@@ -1,0 +1,185 @@
+// public/custom-elements/addons-accordion.js
+// Vertical accordion CE with per-option ± quantity and “More/Less Extras >”
+// Receives data via property `catalog` or attribute `data-catalog`
+// Emits: CustomEvent('addonsChanged', { detail: { selections:[...], totalQuantity, totalPrice, currency } })
+
+(function () {
+  const CSS = `
+    :host { display:block; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Arial, 'Noto Sans', sans-serif; }
+    * { box-sizing: border-box; }
+    .wrap { border:1px solid #e5e7eb; border-radius:12px; overflow:hidden; background:#fff; }
+
+    .cat { display:flex; align-items:center; gap:14px; padding:12px 14px; border-top:1px solid #eef2f7; cursor:pointer; }
+    .cat:first-child { border-top:none; }
+    .cat-thumb { width:42px; height:42px; border-radius:8px; border:1px solid #e5e7eb; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#fff; }
+    .cat-thumb img { width:100%; height:100%; object-fit:cover; }
+    .cat-title { font-weight:700; font-size:14px; color:#111827; }
+    .sp { flex:1; }
+    .cat-btn { font-size:12px; font-weight:600; padding:6px 10px; border-radius:8px; border:1px solid #e2e8f0; background:#ffb0000f; color:#b45309; user-select:none; }
+    .cat-btn:hover { background:#fff7ed; }
+
+    .panel { display:none; background:#fafafa; }
+    .panel.open { display:block; }
+
+    .item { display:grid; grid-template-columns:58px 1fr auto; gap:12px; padding:12px 14px; border-top:1px dashed #e5e7eb; align-items:center; }
+    .item:first-child { border-top:none; }
+    .thumb { width:58px; height:58px; border-radius:10px; overflow:hidden; border:1px solid #e5e7eb; display:flex; align-items:center; justify-content:center; background:#fff; }
+    .thumb img { width:100%; height:100%; object-fit:cover; }
+
+    .mid { display:flex; flex-direction:column; gap:4px; min-width:0; }
+    .name { font-size:13px; font-weight:700; color:#111827; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .note { font-size:12px; color:#6b7280; }
+
+    .right { display:grid; gap:6px; justify-items:end; }
+    .price { font-size:13px; font-weight:700; color:#16a34a; } /* GREEN price */
+    .qty { display:flex; align-items:center; gap:8px; }
+    .btn { width:28px; height:28px; border-radius:8px; border:1px solid #e5e7eb; background:#fff; display:flex; align-items:center; justify-content:center; user-select:none; cursor:pointer; }
+    .btn:active { transform: translateY(1px); }
+    .count { min-width:18px; text-align:center; font-size:12px; font-weight:700; color:#ea580c; }
+
+    .muted { color:#94a3b8; font-style:italic; padding:12px 14px; }
+  `;
+
+  const fmtMoney = (amount, currency='USD') => {
+    const n = Number(amount)||0;
+    return `$${n.toFixed(2)} ${currency}`; // "$9.00 USD"
+  };
+
+  class AddonsAccordion extends HTMLElement {
+    static get observedAttributes() { return ['data-catalog']; }
+
+    constructor() {
+      super();
+      this.attachShadow({ mode: 'open' });
+      this._catalog = null;
+      this._currency = 'USD';
+      this._itemsByKey = new Map();
+      this._counts = new Map();
+
+      const style = document.createElement('style'); style.textContent = CSS;
+      this._root = document.createElement('div'); this._root.className = 'wrap';
+      this.shadowRoot.append(style, this._root);
+      this._renderLoading();
+    }
+
+    set catalog(val) {
+      try { this._catalog = val; this._ingest(); this._render(); }
+      catch (e) { console.warn('[addons-accordion] set catalog failed:', e); this._renderError('Catalog error'); }
+    }
+    get catalog() { return this._catalog; }
+
+    attributeChangedCallback(name, _o, v) {
+      if (name === 'data-catalog' && typeof v === 'string') {
+        try { this.catalog = JSON.parse(v); }
+        catch (e) { console.warn('[addons-accordion] bad data-catalog JSON', e); this._renderError('Bad catalog'); }
+      }
+    }
+
+    connectedCallback() { if (!this._catalog) this._renderLoading(); }
+    getSelections() { return this._buildSelections(); }
+
+    _renderLoading(){ this._root.innerHTML = `<div class="muted">Loading add-ons…</div>`; }
+    _renderError(m){ this._root.innerHTML = `<div class="muted">${m}</div>`; }
+
+    _ingest(){
+      this._itemsByKey.clear();
+      this._currency = (this._catalog && this._catalog.currency) || 'USD';
+      const cats = this._catalog?.categories || [];
+      for (const cat of cats) {
+        for (const it of (cat.items||[])) {
+          const key = `${it.productId}::${it.variantId}`;
+          this._itemsByKey.set(key, it);
+          if (!this._counts.has(key)) this._counts.set(key, 0);
+        }
+      }
+    }
+
+    _render(){
+      const data = this._catalog;
+      if (!data || !Array.isArray(data.categories) || !data.categories.length) {
+        this._root.innerHTML = `<div class="muted">No add-ons available.</div>`;
+        return;
+      }
+
+      this._root.innerHTML = '';
+      data.categories.forEach((cat, idx) => {
+        const catRow = document.createElement('div'); catRow.className='cat';
+        const thumb = document.createElement('div'); thumb.className='cat-thumb';
+        const timg  = cat.items?.[0]?.image;
+        thumb.innerHTML = timg ? `<img alt="" src="${timg}">` : `<span class="muted">—</span>`;
+        const title = document.createElement('div'); title.className='cat-title'; title.textContent = `Include ${cat.title}`;
+        const sp = document.createElement('div'); sp.className='sp';
+        const btn = document.createElement('div'); btn.className='cat-btn'; btn.textContent='More Extras >';
+
+        const panel = document.createElement('div'); panel.className='panel'; panel.dataset.idx=idx;
+
+        (cat.items||[]).forEach(it=>{
+          const key = `${it.productId}::${it.variantId}`;
+          const row = document.createElement('div'); row.className='item'; row.dataset.key=key;
+
+          const th = document.createElement('div'); th.className='thumb';
+          th.innerHTML = it.image ? `<img alt="" src="${it.image}">` : `<span class="muted">no image</span>`;
+
+          const mid = document.createElement('div'); mid.className='mid';
+          const nm  = document.createElement('div'); nm.className='name';
+          nm.textContent = it.choiceName; // show ONLY choice name
+          const note = document.createElement('div'); note.className='note'; note.textContent=cat.optionName;
+          mid.append(nm,note);
+
+          const right = document.createElement('div'); right.className='right';
+          const price = document.createElement('div'); price.className='price';
+          const priced = Number(it.price) > 0;
+          price.textContent = priced ? fmtMoney(it.price, it.currency||this._currency) : 'Courtesy';
+
+          const qty = document.createElement('div'); qty.className='qty';
+          const minus = document.createElement('div'); minus.className='btn'; minus.textContent='–';
+          const cnt = document.createElement('div'); cnt.className='count'; cnt.textContent=String(this._counts.get(key)||0);
+          const plus = document.createElement('div'); plus.className='btn'; plus.textContent='+';
+          qty.append(minus,cnt,plus); right.append(price,qty);
+
+          const update=(d)=>{ const prev=this._counts.get(key)||0; const next=Math.max(0,Math.min(99,prev+d)); this._counts.set(key,next); cnt.textContent=String(next); this._emitChanged(); };
+          minus.addEventListener('click', e=>{ e.stopPropagation(); update(-1); });
+          plus .addEventListener('click', e=>{ e.stopPropagation(); update(+1); });
+
+          row.append(th,mid,right); panel.append(row);
+        });
+
+        const toggle=()=> {
+          const isOpen = panel.classList.contains('open');
+          this.shadowRoot.querySelectorAll('.panel.open').forEach(p => p.classList.remove('open'));
+          this.shadowRoot.querySelectorAll('.cat-btn').forEach(b => b.textContent='More Extras >');
+          if (!isOpen) { panel.classList.add('open'); btn.textContent='Less Extras >'; }
+        };
+        btn.addEventListener('click', e=>{ e.stopPropagation(); toggle(); });
+        catRow.addEventListener('click', toggle);
+
+        catRow.append(thumb,title,sp,btn);
+        this._root.append(catRow, panel);
+      });
+    }
+
+    _emitChanged(){
+      const payload = this._buildSelections();
+      this.dispatchEvent(new CustomEvent('addonsChanged', { bubbles:true, composed:true, detail: payload }));
+    }
+
+    _buildSelections(){
+      let totalQuantity=0, totalPrice=0;
+      const selections=[];
+      for (const [key,qty] of this._counts.entries()){
+        if (qty<=0) continue;
+        const it = this._itemsByKey.get(key); if (!it) continue;
+        totalQuantity += qty;
+        totalPrice += (Number(it.price)||0) * qty;
+        selections.push({
+          productId: it.productId, variantId: it.variantId,
+          optionName: it.optionName, choiceName: it.choiceName,
+          price: Number(it.price)||0, currency: it.currency||this._currency, image: it.image||'', quantity: qty
+        });
+      }
+      return { selections, totalQuantity, totalPrice, currency: this._currency };
+    }
+  }
+
+  customElements.define('addons-accordion', AddonsAccordion);
+})();
